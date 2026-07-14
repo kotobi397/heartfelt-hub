@@ -748,6 +748,101 @@ let cachedImageAgentId: string | null = null;
 let resvgReady: Promise<void> | null = null;
 let arabicFontBytes: Uint8Array | null = null;
 
+const IMAGE_GENERATION_RE = /(?:\b(?:generate|create|make|draw|design|imagine)\b.*\b(?:image|picture|photo|art|illustration|drawing)\b|\b(?:image|picture|art|illustration|drawing)\b.*\b(?:generate|create|make|draw|design)\b|ارسم|إرسم|رسم\s*لي|صمّم|صمم|تصميم\s+ل|تخيّل|تخيل|اصنع\s+(?:لي\s+)?صور[ةه]|أنشئ\s+(?:لي\s+)?صور[ةه]|انشئ\s+(?:لي\s+)?صور[ةه]|ولّد\s+(?:لي\s+)?صور[ةه]|ولد\s+(?:لي\s+)?صور[ةه]|توليد\s+صور[ةه])/iu;
+const IMAGE_GENERATION_CUE_RE = /(?:أنمي|انمي|كرتون|شخصي[ةه]|فتا[ةه]|ولد|رجل|امرأ[ةه]|امرا[ةه]|شعر|يرتدي|ترتدي|جالس|جالسة|واقف|واقفة|خلفي[ةه]|إضاءة|اضاءة|مشهد|خيال|واقعي|سينمائي|ثلاثي\s*الأبعاد|3d|logo|poster|avatar|wallpaper|anime|cartoon|character|wearing|sitting|standing|background|cinematic|realistic)/iu;
+
+function isImageGenerationRequest(text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return false;
+  // Do not steal real-image web search requests such as "صور ميسي".
+  if (/\b(?:pinterest|duckduckgo|real\s+photos?|صور\s+حقيقي|صور\s+من\s+الانترنت|ابحث\s+.*صور|أبحث\s+.*صور|هات\s+صور|اعطني\s+صور|أعطني\s+صور)\b/iu.test(t)) return false;
+  return IMAGE_GENERATION_RE.test(t) || (/\b(?:صور[ةه]|image|picture|photo)\b/iu.test(t) && IMAGE_GENERATION_CUE_RE.test(t));
+}
+
+function imageResponseToBytes(j: any): Uint8Array | null {
+  const urls: string[] = [];
+  const b64s: string[] = [];
+
+  const addMaybe = (value: unknown) => {
+    if (typeof value !== "string" || !value.trim()) return;
+    const s = value.trim();
+    if (s.startsWith("data:image/")) urls.push(s);
+    else if (/^[A-Za-z0-9+/=\n\r]+$/.test(s) && s.length > 200) b64s.push(s);
+  };
+
+  for (const item of Array.isArray(j?.data) ? j.data : []) {
+    addMaybe(item?.b64_json);
+    addMaybe(item?.url);
+  }
+  for (const choice of Array.isArray(j?.choices) ? j.choices : []) {
+    const msg = choice?.message ?? {};
+    for (const img of Array.isArray(msg?.images) ? msg.images : []) addMaybe(img?.image_url?.url ?? img?.url);
+    const content = msg?.content;
+    if (Array.isArray(content)) {
+      for (const part of content) addMaybe(part?.image_url?.url ?? part?.url ?? part?.b64_json ?? part?.data);
+    } else {
+      addMaybe(content);
+    }
+  }
+
+  const raw = b64s[0] ?? (urls[0]?.startsWith("data:image/") ? urls[0].split(",", 2)[1] : null);
+  if (!raw) return null;
+  try {
+    const bin = atob(raw.replace(/\s+/g, ""));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch (e) {
+    console.error("[messenger] image b64 decode failed", e);
+    return null;
+  }
+}
+
+async function generateImageViaLovableGateway(prompt: string, arabicText: string): Promise<Uint8Array | null> {
+  const lovableKey = Deno.env.get("LOVABLE_API_KEY");
+  if (!lovableKey) {
+    console.error("[messenger] LOVABLE_API_KEY missing for image generation");
+    return null;
+  }
+
+  const gatewayPrompt = [
+    "Generate one polished, high-quality, safe-for-work image from the user's request.",
+    "Respect the visual details exactly. Do not add captions, logos, watermarks, UI, or random text.",
+    arabicText.trim()
+      ? "Leave a clean empty horizontal banner area at the bottom of the image for later Arabic text overlay; put no text inside the generated image."
+      : "If the user did not explicitly request visible text, include no text anywhere in the image.",
+    `User request: ${prompt.slice(0, 1800)}`,
+  ].join("\n");
+
+  const models = ["google/gemini-3.1-flash-image", "google/gemini-3-pro-image"];
+  for (const model of models) {
+    try {
+      const res = await fetch("https://ai.gateway.lovable.dev/v1/images/generations", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${lovableKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: [{ type: "text", text: gatewayPrompt }] }],
+          modalities: ["image", "text"],
+        }),
+        signal: AbortSignal.timeout(model.includes("flash") ? 55_000 : 75_000),
+      });
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        console.error("[messenger] gateway image failed", model, res.status, t.slice(0, 500));
+        continue;
+      }
+      const j = await res.json();
+      const bytes = imageResponseToBytes(j);
+      if (bytes && bytes.byteLength > 1000) return bytes;
+      console.error("[messenger] gateway image no bytes", model, JSON.stringify(j).slice(0, 500));
+    } catch (err) {
+      console.error("[messenger] gateway image error", model, err);
+    }
+  }
+  return null;
+}
+
 async function ensureResvg() {
   if (!resvgReady) {
     resvgReady = (async () => {
@@ -950,7 +1045,6 @@ async function llmIsUnsafeImagePrompt(text: string): Promise<boolean> {
 async function generateImage(senderId: string, prompt: string, admin: any, arabicText: string = ""): Promise<string> {
   const key = await getMistralKey();
   const pageToken = Deno.env.get("FB_PAGE_ACCESS_TOKEN");
-  if (!key) return JSON.stringify({ ok: false, error: "no_image_provider" });
   if (!pageToken) return JSON.stringify({ ok: false, error: "fb_token_missing" });
   if (!prompt.trim()) return JSON.stringify({ ok: false, error: "empty_prompt" });
 
@@ -974,9 +1068,6 @@ async function generateImage(senderId: string, prompt: string, admin: any, arabi
     cleanPrompt += ". Leave a clean empty horizontal banner area at the bottom of the image (about 20% of height) with a plain background — no text, no letters, no writing anywhere.";
   }
 
-  const agentId = await ensureImageAgent(key);
-  if (!agentId) return JSON.stringify({ ok: false, error: "agent_unavailable" });
-
   try {
     // Send "typing" hint (best effort)
     fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
@@ -984,48 +1075,72 @@ async function generateImage(senderId: string, prompt: string, admin: any, arabi
       body: JSON.stringify({ recipient: { id: senderId }, sender_action: "typing_on" }),
     }).catch(() => {});
 
-    const convRes = await fetch("https://api.mistral.ai/v1/conversations", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ agent_id: agentId, inputs: cleanPrompt }),
-    });
-    if (!convRes.ok) {
-      const t = await convRes.text();
-      console.error("[messenger] conv failed", convRes.status, t);
-      // Retry once with fresh agent in case cached id was stale
-      if (convRes.status === 404 || convRes.status === 400) {
-        cachedImageAgentId = null;
-      }
-      return JSON.stringify({ ok: false, error: `mistral_${convRes.status}` });
-    }
-    const conv = await convRes.json();
+    // Primary path: Lovable AI Gateway image model. It is more reliable for long
+    // generations than the Mistral agent text loop, so users don't receive a
+    // textual "I'll retry" answer without an actual image.
+    let imgBuf: Uint8Array | null = await generateImageViaLovableGateway(prompt, arabicText);
 
-    // Find tool_file chunk
-    let fileId: string | null = null;
-    const outputs = conv?.outputs ?? [];
-    for (const out of outputs) {
-      const content = out?.content;
-      if (Array.isArray(content)) {
-        for (const chunk of content) {
-          if (chunk?.type === "tool_file" && chunk?.file_id) { fileId = chunk.file_id; break; }
+    // Fallback path: existing Mistral image agent if the gateway is temporarily unavailable.
+    if (!imgBuf && key) {
+      const agentId = await ensureImageAgent(key);
+      if (agentId) {
+        const convRes = await fetch("https://api.mistral.ai/v1/conversations", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ agent_id: agentId, inputs: cleanPrompt }),
+          signal: AbortSignal.timeout(70_000),
+        });
+        if (!convRes.ok) {
+          const t = await convRes.text();
+          console.error("[messenger] conv failed", convRes.status, t);
+          // Retry once with fresh agent in case cached id was stale
+          if (convRes.status === 404 || convRes.status === 400) {
+            cachedImageAgentId = null;
+          }
+        } else {
+          const conv = await convRes.json();
+
+          // Find tool_file chunk
+          let fileId: string | null = null;
+          const outputs = conv?.outputs ?? [];
+          for (const out of outputs) {
+            const content = out?.content;
+            if (Array.isArray(content)) {
+              for (const chunk of content) {
+                if (chunk?.type === "tool_file" && chunk?.file_id) { fileId = chunk.file_id; break; }
+              }
+            }
+            if (fileId) break;
+          }
+          if (!fileId) {
+            console.error("[messenger] no file_id in response", JSON.stringify(conv).slice(0, 500));
+          } else {
+            const fileRes = await fetch(`https://api.mistral.ai/v1/files/${fileId}/content`, {
+              headers: { Authorization: `Bearer ${key}` },
+              signal: AbortSignal.timeout(30_000),
+            });
+            if (!fileRes.ok) {
+              console.error("[messenger] file download failed", fileRes.status);
+            } else {
+              imgBuf = new Uint8Array(await fileRes.arrayBuffer());
+            }
+          }
         }
       }
-      if (fileId) break;
     }
-    if (!fileId) {
-      console.error("[messenger] no file_id in response", JSON.stringify(conv).slice(0, 500));
+
+    if (!imgBuf) {
+      console.error("[messenger] no image bytes produced by any provider");
       return JSON.stringify({ ok: false, error: "no_image_produced" });
     }
 
-    // Download image bytes
-    const fileRes = await fetch(`https://api.mistral.ai/v1/files/${fileId}/content`, {
-      headers: { Authorization: `Bearer ${key}` },
-    });
-    if (!fileRes.ok) {
-      console.error("[messenger] file download failed", fileRes.status);
-      return JSON.stringify({ ok: false, error: "download_failed" });
+    // Normalize generated bytes to PNG so storage content-type and Facebook delivery are consistent.
+    try {
+      const normalized = await Image.decode(imgBuf);
+      imgBuf = await normalized.encode();
+    } catch (e) {
+      console.warn("[messenger] image normalize skipped", e);
     }
-    let imgBuf: Uint8Array<ArrayBufferLike> = new Uint8Array(await fileRes.arrayBuffer());
 
     // If the user requested Arabic text in the image, draw it as an overlay
     // using a real Arabic font (Mistral's image model can't render Arabic correctly).
@@ -1090,7 +1205,7 @@ function shouldEditImage(text: string): boolean {
 async function editUserImage(
   admin: any,
   senderId: string,
-  pageId: string,
+  pageId: string | null,
   pageToken: string,
   sourceUrl: string,
   instruction: string,
@@ -1474,6 +1589,22 @@ async function handleEvent(ev: any, pageId: string | null) {
       await editUserImage(admin, senderId, pageId, pageToken, imageUrls[0], text, userMsgStart);
       return;
     }
+  }
+
+  // Direct image-generation fast path. Do not leave this to the chat model:
+  // when image generation is slow, the model may apologize and promise a retry
+  // instead of actually sending an image. This path always invokes the image tool.
+  if (text && imageUrls.length === 0 && isImageGenerationRequest(text)) {
+    const result = await generateImage(senderId, text, admin);
+    let parsed: any = null;
+    try { parsed = JSON.parse(result); } catch { parsed = null; }
+    if (parsed?.ok === true) {
+      await sendAndLog(admin, senderId, "✅ تم إرسال الصورة.", pageId, userMsgStart, mid ?? null);
+    } else if (!parsed?.user_notified) {
+      console.error("[messenger] direct image generation failed", result);
+      await sendAndLog(admin, senderId, "تعذّر إنشاء الصورة الآن بسبب ضغط الخدمة، جرّب بعد قليل 🙏", pageId, userMsgStart, mid ?? null);
+    }
+    return;
   }
 
   // === Text-command fallback for Facebook Lite / old clients that don't render quick replies ===
@@ -1906,7 +2037,14 @@ async function runWithTools(messages: any[], model: string, senderId: string, ad
       for (const tc of toolCalls) {
         let args: any = {};
         try { args = JSON.parse(tc.function?.arguments ?? "{}"); } catch {}
-        const result = await executeTool(tc.function?.name ?? "", args, senderId, admin);
+      const result = await executeTool(tc.function?.name ?? "", args, senderId, admin);
+      if (tc.function?.name === "generate_image") {
+        let parsed: any = null;
+        try { parsed = JSON.parse(result); } catch { parsed = null; }
+        if (parsed?.ok === true) return "✅ تم إرسال الصورة.";
+        if (parsed?.user_notified) return "";
+        return "تعذّر إنشاء الصورة الآن بسبب ضغط الخدمة، جرّب بعد قليل 🙏";
+      }
         convo.push({ role: "tool", tool_call_id: tc.id, name: tc.function?.name, content: result });
       }
     } catch (err) {
