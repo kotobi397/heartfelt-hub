@@ -323,6 +323,24 @@ const tools = [
   {
     type: "function",
     function: {
+      name: "generate_video",
+      description:
+        "أنشئ فيديو قصير (5 ثوانٍ) بالذكاء الاصطناعي من وصف نصي وأرسله للمستخدم على ماسنجر. استخدمها كلما طلب المستخدم فيديو أو مقطع أو مشهد متحرك. توليد الفيديو يستغرق 1-3 دقائق. مهم: مرّر الوصف بالإنجليزية للجودة الأفضل.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description: "وصف بصري للفيديو بالإنجليزية (مشهد، حركة، إضاءة، أسلوب).",
+          },
+        },
+        required: ["prompt"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "web_search",
       description:
         "ابحث بعمق في الويب بالوقت الفعلي عبر أداة Mistral الرسمية web_search/web_search_premium عن الأخبار، الرياضة، الأسعار، الأحداث الجارية، النتائج، وأي معلومة حديثة أو غير مؤكدة. استخدمها دائماً قبل الإجابة عن أي شيء قد يكون تغيّر.",
@@ -475,6 +493,9 @@ async function executeTool(name: string, args: any, senderId: string, admin: any
     }
     if (name === "generate_image") {
       return await generateImage(senderId, String(args.prompt ?? ""), admin, args.arabic_text ? String(args.arabic_text) : "");
+    }
+    if (name === "generate_video") {
+      return await generateVideo(senderId, String(args.prompt ?? ""), admin);
     }
     if (name === "web_search") {
       return await webSearch(String(args.query ?? ""));
@@ -1190,6 +1211,147 @@ async function generateImage(senderId: string, prompt: string, admin: any, arabi
     return JSON.stringify({ ok: false, error: String(err?.message ?? err) });
   }
 }
+
+// ============ VIDEO GENERATION (Replicate via Lovable Connector Gateway) ============
+// Generates a short AI video from a text prompt using Replicate's
+// wan-video/wan-2.2-t2v-fast model (fast text-to-video, ~1-2 min).
+async function generateVideo(senderId: string, prompt: string, admin: any): Promise<string> {
+  const falKey = Deno.env.get("FAL_KEY");
+  const pageToken = Deno.env.get("FB_PAGE_ACCESS_TOKEN");
+  if (!falKey) return JSON.stringify({ ok: false, error: "fal_not_configured" });
+  if (!pageToken) return JSON.stringify({ ok: false, error: "fb_token_missing" });
+  if (!prompt.trim()) return JSON.stringify({ ok: false, error: "empty_prompt" });
+
+  if (isNsfwPrompt(prompt)) {
+    return await sendNsfwRefusal(senderId, pageToken, admin, "generate");
+  }
+
+  const authHeaders = {
+    "Authorization": `Key ${falKey}`,
+    "Content-Type": "application/json",
+  };
+  // fast + cheap text-to-video on fal.ai
+  const MODEL = "fal-ai/ltx-video";
+
+  // Notify user
+  fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      recipient: { id: senderId },
+      messaging_type: "RESPONSE",
+      message: { text: "🎬 جاري إنشاء الفيديو... قد يستغرق دقيقة أو دقيقتين، انتظر قليلاً." },
+    }),
+  }).catch(() => {});
+
+  try {
+    // Submit to fal queue
+    const createRes = await fetch(`https://queue.fal.run/${MODEL}`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ prompt }),
+    });
+
+    if (!createRes.ok) {
+      const body = await createRes.text();
+      console.error("[messenger] fal create failed", createRes.status, body);
+      const lower = body.toLowerCase();
+      const isBilling = createRes.status === 402 || createRes.status === 429 ||
+        lower.includes("exhausted balance") || lower.includes("top up") || lower.includes("balance");
+      const isAuth = (createRes.status === 401 || createRes.status === 403) && !isBilling;
+      const msg = isBilling
+        ? "⚠️ حساب fal.ai بدون رصيد. أضف رصيداً من fal.ai/dashboard/billing وحاول مجدداً."
+        : isAuth
+          ? "⚠️ مفتاح fal.ai غير صحيح. تحقق من FAL_KEY."
+          : "⚠️ تعذر إنشاء الفيديو من fal.ai حالياً.";
+      await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recipient: { id: senderId },
+          messaging_type: "RESPONSE",
+          message: { text: msg },
+        }),
+      }).catch(() => {});
+      return JSON.stringify({ ok: false, error: isBilling ? "fal_billing" : isAuth ? "fal_auth_failed" : "fal_create_failed", detail: body.slice(0, 300) });
+    }
+
+
+    const created = await createRes.json();
+    const requestId: string = created.request_id;
+    const statusUrl: string = created.status_url || `https://queue.fal.run/${MODEL}/requests/${requestId}/status`;
+    const responseUrl: string = created.response_url || `https://queue.fal.run/${MODEL}/requests/${requestId}`;
+    if (!requestId) return JSON.stringify({ ok: false, error: "no_request_id" });
+
+    // Poll
+    let videoUrl: string | null = null;
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, i < 5 ? 3000 : 6000));
+      const pollRes = await fetch(statusUrl, { headers: { "Authorization": `Key ${falKey}` } });
+      if (!pollRes.ok) continue;
+      const p = await pollRes.json();
+      const st = String(p.status ?? "").toUpperCase();
+      if (st === "COMPLETED") {
+        const rr = await fetch(responseUrl, { headers: { "Authorization": `Key ${falKey}` } });
+        if (!rr.ok) return JSON.stringify({ ok: false, error: "fal_response_failed" });
+        const rj = await rr.json();
+        videoUrl = rj?.video?.url ?? rj?.output?.video?.url ?? (typeof rj?.video === "string" ? rj.video : null);
+        break;
+      }
+      if (st === "FAILED" || st === "CANCELLED" || st === "ERROR") {
+        console.error("[messenger] fal failed", p);
+        return JSON.stringify({ ok: false, error: "prediction_failed", detail: JSON.stringify(p).slice(0, 300) });
+      }
+    }
+
+    if (!videoUrl) return JSON.stringify({ ok: false, error: "prediction_timeout" });
+
+    // Download + re-host on Supabase storage
+    const vidRes = await fetch(videoUrl);
+    if (!vidRes.ok) return JSON.stringify({ ok: false, error: "download_failed" });
+    const vidBuf = new Uint8Array(await vidRes.arrayBuffer());
+
+    const path = `videos/${senderId}/${Date.now()}.mp4`;
+    const { error: upErr } = await admin.storage.from("bot-media").upload(path, vidBuf, {
+      contentType: "video/mp4", upsert: false,
+    });
+    if (upErr) {
+      console.error("[messenger] storage video upload failed", upErr);
+      return JSON.stringify({ ok: false, error: "upload_failed" });
+    }
+    const { data: signed, error: sErr } = await admin.storage
+      .from("bot-media").createSignedUrl(path, 24 * 3600);
+    if (sErr || !signed?.signedUrl) return JSON.stringify({ ok: false, error: "sign_failed" });
+
+    const fbRes = await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        recipient: { id: senderId },
+        messaging_type: "RESPONSE",
+        message: {
+          attachment: { type: "video", payload: { url: signed.signedUrl, is_reusable: false } },
+        },
+      }),
+    });
+    if (!fbRes.ok) {
+      const t = await fbRes.text();
+      console.error("[messenger] FB video send failed", fbRes.status, t);
+      return JSON.stringify({ ok: false, error: "fb_send_failed", detail: t });
+    }
+
+    await admin.from("messages").insert({
+      facebook_user_id: senderId,
+      sender_type: "bot",
+      message_text: `🎬 [فيديو أُرسل] ${prompt.slice(0, 120)}`,
+    });
+
+    return JSON.stringify({ ok: true, sent: true, prompt });
+  } catch (err: any) {
+    console.error("[messenger] generate_video error", err);
+    return JSON.stringify({ ok: false, error: String(err?.message ?? err) });
+  }
+}
+
+
+
 
 // ============ IMAGE EDITING (Lovable AI Gateway — Gemini Nano Banana 2) ============
 // Edits a user-supplied image (retouch / enhance / change something) while
