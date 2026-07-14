@@ -1597,26 +1597,20 @@ async function handleEvent(ev: any, pageId: string | null) {
       .maybeSingle();
     const lastBot = (lastBotRow?.message_text as string | undefined) ?? "";
 
-    // Fast-path: strong keyword match forces satellite/map intent before the LLM classifier
-    // (the classifier occasionally mis-routes "صور قمر صناعي لـ..." to image_search).
-    const satRegex = /(?:صور[ةه]?\s*(?:الـ|ال)?قمر\s*صناعي(?:ة)?|صور[ةه]?\s*جوي(?:ة)?|من\s*الفضاء|satellite|aerial|from\s+space)/i;
+    // Fast-path: strong keyword match forces map intent before the LLM classifier.
     const mapRegex = /(?:خريط[ةه]|خارط[ةه]|موقع\s*(?:على|في)\s*الخريطة|أين\s*تقع|وين\s*تقع|where\s+is|map\s+of|on\s+the\s+map)/i;
     const stripLead = (s: string) => s
       .replace(/^\s*(?:أرني|ارني|اعطني|أعطني|هات|ابعث|ابعت|ممكن|أريد|اريد|ابغى|من\s*فضلك|رجاء|رجاءً|please|show\s+me|give\s+me)\s+/iu, "")
-      .replace(satRegex, "")
       .replace(mapRegex, "")
       .replace(/^\s*(?:(?:لـ|لل|ل|في|بـ|ب|من)\s*|(?:of|for|the)\s+)/i, "")
       .replace(/[«»"'`.،,؟?!]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-    if (satRegex.test(text)) {
-      const q = stripLead(text);
-      if (q.length >= 2) { await handleMapSearch(admin, senderId, q, pageId, userMsgStart, true); return; }
-    }
     if (mapRegex.test(text)) {
       const q = stripLead(text);
       if (q.length >= 2) { await handleMapSearch(admin, senderId, q, pageId, userMsgStart, false); return; }
     }
+
 
     const cls = await classifyUnifiedIntent(text, lastBot, hasActive);
     if (cls) {
@@ -1641,10 +1635,8 @@ async function handleEvent(ev: any, pageId: string | null) {
         await handleMapSearch(admin, senderId, cls.query, pageId, userMsgStart, false);
         return;
       }
-      if (cls.intent === "satellite" && cls.query && cls.query.length >= 2) {
-        await handleMapSearch(admin, senderId, cls.query, pageId, userMsgStart, true);
-        return;
-      }
+      // satellite intent removed — treat as chat.
+
       // "chat" (or any low-confidence result) → fall through to main LLM.
     }
   }
