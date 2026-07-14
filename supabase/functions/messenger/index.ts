@@ -323,6 +323,24 @@ const tools = [
   {
     type: "function",
     function: {
+      name: "generate_video",
+      description:
+        "أنشئ فيديو قصير (5 ثوانٍ) بالذكاء الاصطناعي من وصف نصي وأرسله للمستخدم على ماسنجر. استخدمها كلما طلب المستخدم فيديو أو مقطع أو مشهد متحرك. توليد الفيديو يستغرق 1-3 دقائق. مهم: مرّر الوصف بالإنجليزية للجودة الأفضل.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description: "وصف بصري للفيديو بالإنجليزية (مشهد، حركة، إضاءة، أسلوب).",
+          },
+        },
+        required: ["prompt"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "web_search",
       description:
         "ابحث بعمق في الويب بالوقت الفعلي عبر أداة Mistral الرسمية web_search/web_search_premium عن الأخبار، الرياضة، الأسعار، الأحداث الجارية، النتائج، وأي معلومة حديثة أو غير مؤكدة. استخدمها دائماً قبل الإجابة عن أي شيء قد يكون تغيّر.",
@@ -475,6 +493,9 @@ async function executeTool(name: string, args: any, senderId: string, admin: any
     }
     if (name === "generate_image") {
       return await generateImage(senderId, String(args.prompt ?? ""), admin, args.arabic_text ? String(args.arabic_text) : "");
+    }
+    if (name === "generate_video") {
+      return await generateVideo(senderId, String(args.prompt ?? ""), admin);
     }
     if (name === "web_search") {
       return await webSearch(String(args.query ?? ""));
@@ -1190,6 +1211,147 @@ async function generateImage(senderId: string, prompt: string, admin: any, arabi
     return JSON.stringify({ ok: false, error: String(err?.message ?? err) });
   }
 }
+
+// ============ VIDEO GENERATION (Replicate via Lovable Connector Gateway) ============
+// Generates a short AI video from a text prompt using Replicate's
+// wan-video/wan-2.2-t2v-fast model (fast text-to-video, ~1-2 min).
+async function generateVideo(senderId: string, prompt: string, admin: any): Promise<string> {
+  const lovableKey = Deno.env.get("LOVABLE_API_KEY");
+  const replicateKey = Deno.env.get("REPLICATE_API_KEY");
+  const pageToken = Deno.env.get("FB_PAGE_ACCESS_TOKEN");
+  if (!lovableKey || !replicateKey) return JSON.stringify({ ok: false, error: "replicate_not_configured" });
+  if (!pageToken) return JSON.stringify({ ok: false, error: "fb_token_missing" });
+  if (!prompt.trim()) return JSON.stringify({ ok: false, error: "empty_prompt" });
+
+  // Safety check on prompt (reuse existing NSFW filters)
+  if (isNsfwPrompt(prompt)) {
+    return await sendNsfwRefusal(senderId, pageToken, admin, "generate");
+  }
+
+  const GW = "https://connector-gateway.lovable.dev/replicate/v1";
+  const authHeaders = {
+    "Authorization": `Bearer ${lovableKey}`,
+    "X-Connection-Api-Key": replicateKey,
+    "Content-Type": "application/json",
+  };
+
+  // Notify the user — this takes 1-3 minutes.
+  fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      recipient: { id: senderId },
+      messaging_type: "RESPONSE",
+      message: { text: "🎬 جاري إنشاء الفيديو... قد يستغرق دقيقة أو دقيقتين، انتظر قليلاً." },
+    }),
+  }).catch(() => {});
+
+  try {
+    // Create prediction — wan-2.2-t2v-fast is the fastest text-to-video on Replicate.
+    const createRes = await fetch(`${GW}/models/wan-video/wan-2.2-t2v-fast/predictions`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        input: {
+          prompt,
+          aspect_ratio: "16:9",
+          num_frames: 81,
+          resolution: "480p",
+        },
+      }),
+    });
+
+    if (createRes.status === 402) {
+      const body = await createRes.text();
+      console.error("[messenger] replicate 402", body);
+      await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recipient: { id: senderId },
+          messaging_type: "RESPONSE",
+          message: { text: "⚠️ حساب Replicate ليس فيه رصيد كافي لتوليد الفيديو. أضف رصيداً من replicate.com/account/billing وحاول مجدداً." },
+        }),
+      }).catch(() => {});
+      return JSON.stringify({ ok: false, error: "insufficient_credit" });
+    }
+
+    if (!createRes.ok) {
+      const body = await createRes.text();
+      console.error("[messenger] replicate create failed", createRes.status, body);
+      return JSON.stringify({ ok: false, error: "replicate_create_failed", detail: body.slice(0, 300) });
+    }
+
+    const created = await createRes.json();
+    const pid: string = created.id;
+    if (!pid) return JSON.stringify({ ok: false, error: "no_prediction_id" });
+
+    // Poll — up to ~5 minutes with backoff.
+    let videoUrl: string | null = null;
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, i < 5 ? 3000 : 6000));
+      const pollRes = await fetch(`${GW}/predictions/${pid}`, { headers: authHeaders });
+      if (!pollRes.ok) continue;
+      const p = await pollRes.json();
+      if (p.status === "succeeded") {
+        const out = p.output;
+        videoUrl = Array.isArray(out) ? out[0] : (typeof out === "string" ? out : null);
+        break;
+      }
+      if (p.status === "failed" || p.status === "canceled") {
+        console.error("[messenger] replicate prediction failed", p.error);
+        return JSON.stringify({ ok: false, error: "prediction_failed", detail: String(p.error ?? "") });
+      }
+    }
+
+    if (!videoUrl) return JSON.stringify({ ok: false, error: "prediction_timeout" });
+
+    // Download the video and re-host on Supabase storage (Replicate URLs expire ~1h).
+    const vidRes = await fetch(videoUrl);
+    if (!vidRes.ok) return JSON.stringify({ ok: false, error: "download_failed" });
+    const vidBuf = new Uint8Array(await vidRes.arrayBuffer());
+
+    const path = `videos/${senderId}/${Date.now()}.mp4`;
+    const { error: upErr } = await admin.storage.from("bot-media").upload(path, vidBuf, {
+      contentType: "video/mp4", upsert: false,
+    });
+    if (upErr) {
+      console.error("[messenger] storage video upload failed", upErr);
+      return JSON.stringify({ ok: false, error: "upload_failed" });
+    }
+    const { data: signed, error: sErr } = await admin.storage
+      .from("bot-media").createSignedUrl(path, 24 * 3600);
+    if (sErr || !signed?.signedUrl) return JSON.stringify({ ok: false, error: "sign_failed" });
+
+    // Send video attachment to Facebook Messenger.
+    const fbRes = await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        recipient: { id: senderId },
+        messaging_type: "RESPONSE",
+        message: {
+          attachment: { type: "video", payload: { url: signed.signedUrl, is_reusable: false } },
+        },
+      }),
+    });
+    if (!fbRes.ok) {
+      const t = await fbRes.text();
+      console.error("[messenger] FB video send failed", fbRes.status, t);
+      return JSON.stringify({ ok: false, error: "fb_send_failed", detail: t });
+    }
+
+    await admin.from("messages").insert({
+      facebook_user_id: senderId,
+      sender_type: "bot",
+      message_text: `🎬 [فيديو أُرسل] ${prompt.slice(0, 120)}`,
+    });
+
+    return JSON.stringify({ ok: true, sent: true, prompt });
+  } catch (err: any) {
+    console.error("[messenger] generate_video error", err);
+    return JSON.stringify({ ok: false, error: String(err?.message ?? err) });
+  }
+}
+
+
 
 // ============ IMAGE EDITING (Lovable AI Gateway — Gemini Nano Banana 2) ============
 // Edits a user-supplied image (retouch / enhance / change something) while
