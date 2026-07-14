@@ -2938,6 +2938,44 @@ async function multiImageSearch(query: string, offset = 0): Promise<string[]> {
   return merged;
 }
 
+// Download an image from an untrusted source and rehost it on bot-media,
+// returning a short-lived signed URL that Facebook can reliably fetch.
+async function fetchAndUploadSearchImage(admin: any, senderId: string, imageUrl: string): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    let r: Response;
+    try {
+      r = await fetch(imageUrl, {
+        headers: {
+          "User-Agent": IMG_UA,
+          "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+          "Referer": "https://www.google.com/",
+        },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!r.ok) { console.warn("[img] rehost status", r.status, imageUrl.slice(0, 120)); return null; }
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    if (!ct.startsWith("image/")) { console.warn("[img] rehost bad ct", ct); return null; }
+    const buf = new Uint8Array(await r.arrayBuffer());
+    if (buf.byteLength < 800 || buf.byteLength > 8 * 1024 * 1024) return null;
+    const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : ct.includes("gif") ? "gif" : "jpg";
+    const path = `search/${senderId}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const { error: upErr } = await admin.storage.from("bot-media").upload(path, buf, {
+      contentType: ct, upsert: false,
+    });
+    if (upErr) { console.error("[img] upload err", upErr); return null; }
+    const { data: signed } = await admin.storage.from("bot-media").createSignedUrl(path, 3600);
+    return signed?.signedUrl ?? null;
+  } catch (e) {
+    console.warn("[img] rehost err", (e as Error).message);
+    return null;
+  }
+}
+
 async function handleImageSearch(admin: any, senderId: string, query: string, pageId: string | null, userMsgStart: number, offset = 0) {
   // === سلامة: نفس فلاتر توليد الصور تُطبَّق على البحث لالتزام سياسات Meta ===
   if (isNsfwPrompt(query) || await llmIsUnsafeImagePrompt(query)) {
@@ -2961,7 +2999,12 @@ async function handleImageSearch(admin: any, senderId: string, query: string, pa
   let sent = 0;
   for (const url of urls) {
     if (sent >= IMG_SEARCH_MAX) break;
-    const ok = await fbSendRaw(senderId, { attachment: { type: "image", payload: { url, is_reusable: false } } });
+    // Rehost the image to bot-media so Facebook can always fetch it.
+    // Pinterest/DDG results often reject Facebook's fetcher (hotlink protection),
+    // and FB's Send API returns 200 OK even when it later fails to deliver.
+    const hosted = await fetchAndUploadSearchImage(admin, senderId, url);
+    if (!hosted) continue;
+    const ok = await fbSendRaw(senderId, { attachment: { type: "image", payload: { url: hosted, is_reusable: false } } });
     if (ok) {
       sent++;
       await admin.from("messages").insert({
