@@ -1635,10 +1635,8 @@ async function handleEvent(ev: any, pageId: string | null) {
         await handleMapSearch(admin, senderId, cls.query, pageId, userMsgStart, false);
         return;
       }
-      if (cls.intent === "satellite" && cls.query && cls.query.length >= 2) {
-        await handleMapSearch(admin, senderId, cls.query, pageId, userMsgStart, true);
-        return;
-      }
+      // satellite intent removed — treat as chat.
+
       // "chat" (or any low-confidence result) → fall through to main LLM.
     }
   }
