@@ -1590,6 +1590,22 @@ async function handleEvent(ev: any, pageId: string | null) {
     }
   }
 
+  // Direct image-generation fast path. Do not leave this to the chat model:
+  // when image generation is slow, the model may apologize and promise a retry
+  // instead of actually sending an image. This path always invokes the image tool.
+  if (text && imageUrls.length === 0 && isImageGenerationRequest(text)) {
+    const result = await generateImage(senderId, text, admin);
+    let parsed: any = null;
+    try { parsed = JSON.parse(result); } catch { parsed = null; }
+    if (parsed?.ok === true) {
+      await sendAndLog(admin, senderId, "✅ تم إرسال الصورة.", pageId, userMsgStart, mid ?? null);
+    } else if (!parsed?.user_notified) {
+      console.error("[messenger] direct image generation failed", result);
+      await sendAndLog(admin, senderId, "تعذّر إنشاء الصورة الآن بسبب ضغط الخدمة، جرّب بعد قليل 🙏", pageId, userMsgStart, mid ?? null);
+    }
+    return;
+  }
+
   // === Text-command fallback for Facebook Lite / old clients that don't render quick replies ===
   if (text) {
     const normalized = text.replace(/[.،,!؟?]+$/g, "").trim();
