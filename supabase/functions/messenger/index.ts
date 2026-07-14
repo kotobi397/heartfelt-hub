@@ -1599,13 +1599,13 @@ async function handleEvent(ev: any, pageId: string | null) {
 
     // Fast-path: strong keyword match forces satellite/map intent before the LLM classifier
     // (the classifier occasionally mis-routes "صور قمر صناعي لـ..." to image_search).
-    const satRegex = /(?:صور[ةه]?\s*(?:الـ)?قمر\s*صناع|صور[ةه]?\s*جوي|من\s*الفضاء|satellite|aerial|from\s+space)/i;
+    const satRegex = /(?:صور[ةه]?\s*(?:الـ|ال)?قمر\s*صناعي(?:ة)?|صور[ةه]?\s*جوي(?:ة)?|من\s*الفضاء|satellite|aerial|from\s+space)/i;
     const mapRegex = /(?:خريط[ةه]|خارط[ةه]|موقع\s*(?:على|في)\s*الخريطة|أين\s*تقع|وين\s*تقع|where\s+is|map\s+of|on\s+the\s+map)/i;
     const stripLead = (s: string) => s
       .replace(/^\s*(?:أرني|ارني|اعطني|أعطني|هات|ابعث|ابعت|ممكن|أريد|اريد|ابغى|من\s*فضلك|رجاء|رجاءً|please|show\s+me|give\s+me)\s+/iu, "")
       .replace(satRegex, "")
       .replace(mapRegex, "")
-      .replace(/^\s*(?:لـ|ل|ل\s*|of|for|the)\s+/i, "")
+      .replace(/^\s*(?:لـ|لل|ل|في|ب|بـ|من|of|for|the)\s+/i, "")
       .replace(/[«»"'`.،,؟?!]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
