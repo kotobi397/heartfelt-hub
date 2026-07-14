@@ -323,24 +323,6 @@ const tools = [
   {
     type: "function",
     function: {
-      name: "generate_video",
-      description:
-        "أنشئ فيديو قصير (5 ثوانٍ) بالذكاء الاصطناعي من وصف نصي وأرسله للمستخدم على ماسنجر. استخدمها كلما طلب المستخدم فيديو أو مقطع أو مشهد متحرك. توليد الفيديو يستغرق 1-3 دقائق. مهم: مرّر الوصف بالإنجليزية للجودة الأفضل.",
-      parameters: {
-        type: "object",
-        properties: {
-          prompt: {
-            type: "string",
-            description: "وصف بصري للفيديو بالإنجليزية (مشهد، حركة، إضاءة، أسلوب).",
-          },
-        },
-        required: ["prompt"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "web_search",
       description:
         "ابحث بعمق في الويب بالوقت الفعلي عبر أداة Mistral الرسمية web_search/web_search_premium عن الأخبار، الرياضة، الأسعار، الأحداث الجارية، النتائج، وأي معلومة حديثة أو غير مؤكدة. استخدمها دائماً قبل الإجابة عن أي شيء قد يكون تغيّر.",
@@ -493,9 +475,6 @@ async function executeTool(name: string, args: any, senderId: string, admin: any
     }
     if (name === "generate_image") {
       return await generateImage(senderId, String(args.prompt ?? ""), admin, args.arabic_text ? String(args.arabic_text) : "");
-    }
-    if (name === "generate_video") {
-      return await generateVideo(senderId, String(args.prompt ?? ""), admin);
     }
     if (name === "web_search") {
       return await webSearch(String(args.query ?? ""));
@@ -771,7 +750,6 @@ let arabicFontBytes: Uint8Array | null = null;
 
 const IMAGE_GENERATION_RE = /(?:\b(?:generate|create|make|draw|design|imagine)\b.*\b(?:image|picture|photo|art|illustration|drawing)\b|\b(?:image|picture|art|illustration|drawing)\b.*\b(?:generate|create|make|draw|design)\b|ارسم|إرسم|رسم\s*لي|صمّم|صمم|تصميم\s+ل|تخيّل|تخيل|اصنع\s+(?:لي\s+)?صور[ةه]|أنشئ\s+(?:لي\s+)?صور[ةه]|انشئ\s+(?:لي\s+)?صور[ةه]|ولّد\s+(?:لي\s+)?صور[ةه]|ولد\s+(?:لي\s+)?صور[ةه]|توليد\s+صور[ةه])/iu;
 const IMAGE_GENERATION_CUE_RE = /(?:أنمي|انمي|كرتون|شخصي[ةه]|فتا[ةه]|ولد|رجل|امرأ[ةه]|امرا[ةه]|شعر|يرتدي|ترتدي|جالس|جالسة|واقف|واقفة|خلفي[ةه]|إضاءة|اضاءة|مشهد|خيال|واقعي|سينمائي|ثلاثي\s*الأبعاد|3d|logo|poster|avatar|wallpaper|anime|cartoon|character|wearing|sitting|standing|background|cinematic|realistic)/iu;
-const VIDEO_GENERATION_RE = /(?:\b(?:generate|create|make|imagine)\b.*\b(?:video|clip|movie|animation)\b|\b(?:video|clip|movie|animation)\b.*\b(?:generate|create|make)\b|(?:اعمل|اصنع|أنشئ|انشئ|ولّد|ولد|سوي|سوّي|اصمم|صمّم|صمم)\s+(?:لي\s+)?(?:فيديو|ڤيديو|مقطع|مشهد\s+متحرك)|توليد\s+(?:فيديو|ڤيديو|مقطع)|فيديو\s+(?:عن|ل|من|يظهر)|مقطع\s+(?:عن|ل|من|يظهر))/iu;
 
 function isImageGenerationRequest(text: string): boolean {
   const t = (text || "").trim();
@@ -779,12 +757,6 @@ function isImageGenerationRequest(text: string): boolean {
   // Do not steal real-image web search requests such as "صور ميسي".
   if (/\b(?:pinterest|duckduckgo|real\s+photos?|صور\s+حقيقي|صور\s+من\s+الانترنت|ابحث\s+.*صور|أبحث\s+.*صور|هات\s+صور|اعطني\s+صور|أعطني\s+صور)\b/iu.test(t)) return false;
   return IMAGE_GENERATION_RE.test(t) || (/\b(?:صور[ةه]|image|picture|photo)\b/iu.test(t) && IMAGE_GENERATION_CUE_RE.test(t));
-}
-
-function isVideoGenerationRequest(text: string): boolean {
-  const t = (text || "").trim();
-  if (!t) return false;
-  return VIDEO_GENERATION_RE.test(t);
 }
 
 function imageResponseToBytes(j: any): Uint8Array | null {
@@ -1219,204 +1191,6 @@ async function generateImage(senderId: string, prompt: string, admin: any, arabi
   }
 }
 
-// ============ VIDEO GENERATION (PiAPI — Kling text-to-video) ============
-// Uses PiAPI unified endpoint: POST /api/v1/task then poll GET /api/v1/task/{id}
-// Docs: https://piapi.ai/docs/kling-api/create-task
-async function generateVideo(senderId: string, prompt: string, admin: any): Promise<string> {
-  const piapiKey = Deno.env.get("PIAPI_KEY");
-  const pageToken = Deno.env.get("FB_PAGE_ACCESS_TOKEN");
-  if (!piapiKey) return JSON.stringify({ ok: false, error: "piapi_not_configured" });
-  if (!pageToken) return JSON.stringify({ ok: false, error: "fb_token_missing" });
-  if (!prompt.trim()) return JSON.stringify({ ok: false, error: "empty_prompt" });
-
-  if (isNsfwPrompt(prompt)) {
-    return await sendNsfwRefusal(senderId, pageToken, admin, "generate");
-  }
-
-  const authHeaders = {
-    "x-api-key": piapiKey,
-    "Content-Type": "application/json",
-  };
-
-  // Notify user
-  fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      recipient: { id: senderId },
-      messaging_type: "RESPONSE",
-      message: { text: "🎬 جاري إنشاء الفيديو... قد يستغرق دقيقة أو أكثر، انتظر قليلاً." },
-    }),
-  }).catch(() => {});
-
-  try {
-    const taskPayloads = [
-      {
-        label: "kling",
-        payload: {
-          model: "kling",
-          task_type: "video_generation",
-          input: {
-            prompt,
-            negative_prompt: "",
-            cfg_scale: 0.5,
-            duration: 5,
-            aspect_ratio: "16:9",
-            mode: "std",
-          },
-          // Do not force PAYG (`public`). Leaving service_mode empty lets PiAPI use
-          // the workspace's configured mode/trial eligibility instead of always
-          // trying to freeze paid API credits.
-          config: { service_mode: "", webhook_config: { endpoint: "", secret: "" } },
-        },
-      },
-      {
-        label: "seedance-2-mini",
-        payload: {
-          model: "seedance",
-          task_type: "seedance-2-mini",
-          input: {
-            prompt,
-            mode: "text_to_video",
-            duration: 5,
-            aspect_ratio: "16:9",
-            resolution: "480p",
-            audio: false,
-          },
-          config: { service_mode: "", webhook_config: { endpoint: "", secret: "" } },
-        },
-      },
-    ];
-
-    let created: any = null;
-    let taskId: string | undefined;
-    let lastCreateStatus = 0;
-    let lastCreateBody = "";
-
-    for (const spec of taskPayloads) {
-      const createRes = await fetch("https://api.piapi.ai/api/v1/task", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify(spec.payload),
-      });
-      const body = await createRes.text();
-      lastCreateStatus = createRes.status;
-      lastCreateBody = body;
-
-      if (createRes.ok) {
-        try { created = JSON.parse(body); } catch { created = null; }
-        taskId = created?.data?.task_id;
-        if (taskId) {
-          console.log("[messenger] piapi task created", spec.label, taskId);
-          break;
-        }
-        console.error("[messenger] piapi no task_id", spec.label, body);
-        continue;
-      }
-
-      console.error("[messenger] piapi create failed", spec.label, createRes.status, body);
-      const lower = body.toLowerCase();
-      const isAuth = createRes.status === 401 || createRes.status === 403;
-      if (isAuth) break;
-    }
-
-    if (!taskId) {
-      const body = lastCreateBody;
-      const lower = body.toLowerCase();
-      const isBilling = lastCreateStatus === 402 || lastCreateStatus === 429 ||
-        lower.includes("insufficient") || lower.includes("balance") || lower.includes("quota");
-      const isAuth = lastCreateStatus === 401 || lastCreateStatus === 403;
-      const msg = isBilling
-        ? "⚠️ PiAPI رفض إنشاء الفيديو لأن رصيد API غير متاح أو محجوز. إن كان لديك رصيد تجربة في Playground فقد لا يكون مفعّلاً لطلبات API؛ راجع Balance/Frozen quotas في PiAPI أو راسل دعمهم لمسح الرصيد المحجوز."
-        : isAuth
-          ? "⚠️ مفتاح PiAPI غير صحيح. تحقق من PIAPI_KEY."
-          : "⚠️ تعذر إنشاء الفيديو من PiAPI حالياً.";
-      await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          recipient: { id: senderId },
-          messaging_type: "RESPONSE",
-          message: { text: msg },
-        }),
-      }).catch(() => {});
-      return JSON.stringify({ ok: false, error: isBilling ? "piapi_billing" : isAuth ? "piapi_auth_failed" : "piapi_create_failed", detail: body.slice(0, 300) });
-    }
-
-    // Poll — Kling std ~1-3 min. Up to ~5 min.
-    let videoUrl: string | null = null;
-    for (let i = 0; i < 60; i++) {
-      await new Promise((r) => setTimeout(r, i < 5 ? 4000 : 6000));
-      const pollRes = await fetch(`https://api.piapi.ai/api/v1/task/${taskId}`, {
-        headers: { "x-api-key": piapiKey },
-      });
-      if (!pollRes.ok) continue;
-      const pj = await pollRes.json();
-      const st = String(pj?.data?.status ?? "").toLowerCase();
-      if (st === "completed" || st === "success") {
-        videoUrl = pj?.data?.output?.video_url
-          ?? pj?.data?.output?.works?.[0]?.video?.resource
-          ?? pj?.data?.output?.video?.url
-          ?? (typeof pj?.data?.output?.video === "string" ? pj.data.output.video : null)
-          ?? null;
-        break;
-      }
-      if (st === "failed" || st === "cancelled" || st === "error") {
-        const errMsg = pj?.data?.error?.message || pj?.data?.error?.raw_message || "";
-        console.error("[messenger] piapi task failed", pj?.data?.error);
-        return JSON.stringify({ ok: false, error: "prediction_failed", detail: String(errMsg).slice(0, 300) });
-      }
-    }
-
-    if (!videoUrl) return JSON.stringify({ ok: false, error: "prediction_timeout" });
-
-    // Download + re-host on Supabase storage
-    const vidRes = await fetch(videoUrl);
-    if (!vidRes.ok) return JSON.stringify({ ok: false, error: "download_failed" });
-    const vidBuf = new Uint8Array(await vidRes.arrayBuffer());
-
-    const path = `videos/${senderId}/${Date.now()}.mp4`;
-    const { error: upErr } = await admin.storage.from("bot-media").upload(path, vidBuf, {
-      contentType: "video/mp4", upsert: false,
-    });
-    if (upErr) {
-      console.error("[messenger] storage video upload failed", upErr);
-      return JSON.stringify({ ok: false, error: "upload_failed" });
-    }
-    const { data: signed, error: sErr } = await admin.storage
-      .from("bot-media").createSignedUrl(path, 24 * 3600);
-    if (sErr || !signed?.signedUrl) return JSON.stringify({ ok: false, error: "sign_failed" });
-
-    const fbRes = await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        recipient: { id: senderId },
-        messaging_type: "RESPONSE",
-        message: {
-          attachment: { type: "video", payload: { url: signed.signedUrl, is_reusable: false } },
-        },
-      }),
-    });
-    if (!fbRes.ok) {
-      const t = await fbRes.text();
-      console.error("[messenger] FB video send failed", fbRes.status, t);
-      return JSON.stringify({ ok: false, error: "fb_send_failed", detail: t });
-    }
-
-    await admin.from("messages").insert({
-      facebook_user_id: senderId,
-      sender_type: "bot",
-      message_text: `🎬 [فيديو أُرسل] ${prompt.slice(0, 120)}`,
-    });
-
-    return JSON.stringify({ ok: true, sent: true, prompt });
-  } catch (err: any) {
-    console.error("[messenger] generate_video error", err);
-    return JSON.stringify({ ok: false, error: String(err?.message ?? err) });
-  }
-}
-
-
-
-
 // ============ IMAGE EDITING (Lovable AI Gateway — Gemini Nano Banana 2) ============
 // Edits a user-supplied image (retouch / enhance / change something) while
 // keeping the original composition. Uses google/gemini-3.1-flash-image because
@@ -1825,19 +1599,6 @@ async function handleEvent(ev: any, pageId: string | null) {
   // Direct image-generation fast path. Do not leave this to the chat model:
   // when image generation is slow, the model may apologize and promise a retry
   // instead of actually sending an image. This path always invokes the image tool.
-  if (text && imageUrls.length === 0 && isVideoGenerationRequest(text)) {
-    const result = await generateVideo(senderId, text, admin);
-    let parsed: any = null;
-    try { parsed = JSON.parse(result); } catch { parsed = null; }
-    if (parsed?.ok === true) {
-      await sendAndLog(admin, senderId, "✅ تم إرسال الفيديو.", pageId, userMsgStart, mid ?? null);
-    } else if (!parsed?.user_notified) {
-      console.error("[messenger] direct video generation failed", result);
-      await sendAndLog(admin, senderId, "تعذّر إنشاء الفيديو الآن. إذا ظهر خطأ رصيد فهو من رصيد API في PiAPI وليس من إعداد البوت.", pageId, userMsgStart, mid ?? null);
-    }
-    return;
-  }
-
   if (text && imageUrls.length === 0 && isImageGenerationRequest(text)) {
     const result = await generateImage(senderId, text, admin);
     let parsed: any = null;
