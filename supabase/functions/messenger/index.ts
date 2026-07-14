@@ -494,6 +494,9 @@ async function executeTool(name: string, args: any, senderId: string, admin: any
     if (name === "generate_image") {
       return await generateImage(senderId, String(args.prompt ?? ""), admin, args.arabic_text ? String(args.arabic_text) : "");
     }
+    if (name === "generate_video") {
+      return await generateVideo(senderId, String(args.prompt ?? ""), admin);
+    }
     if (name === "web_search") {
       return await webSearch(String(args.query ?? ""));
     }
