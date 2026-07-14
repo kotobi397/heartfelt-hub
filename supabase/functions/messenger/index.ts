@@ -1599,13 +1599,13 @@ async function handleEvent(ev: any, pageId: string | null) {
 
     // Fast-path: strong keyword match forces satellite/map intent before the LLM classifier
     // (the classifier occasionally mis-routes "صور قمر صناعي لـ..." to image_search).
-    const satRegex = /(?:صور[ةه]?\s*(?:الـ)?قمر\s*صناع|صور[ةه]?\s*جوي|من\s*الفضاء|satellite|aerial|from\s+space)/i;
+    const satRegex = /(?:صور[ةه]?\s*(?:الـ|ال)?قمر\s*صناعي(?:ة)?|صور[ةه]?\s*جوي(?:ة)?|من\s*الفضاء|satellite|aerial|from\s+space)/i;
     const mapRegex = /(?:خريط[ةه]|خارط[ةه]|موقع\s*(?:على|في)\s*الخريطة|أين\s*تقع|وين\s*تقع|where\s+is|map\s+of|on\s+the\s+map)/i;
     const stripLead = (s: string) => s
       .replace(/^\s*(?:أرني|ارني|اعطني|أعطني|هات|ابعث|ابعت|ممكن|أريد|اريد|ابغى|من\s*فضلك|رجاء|رجاءً|please|show\s+me|give\s+me)\s+/iu, "")
       .replace(satRegex, "")
       .replace(mapRegex, "")
-      .replace(/^\s*(?:لـ|ل|ل\s*|of|for|the)\s+/i, "")
+      .replace(/^\s*(?:(?:لـ|لل|ل|في|بـ|ب|من)\s*|(?:of|for|the)\s+)/i, "")
       .replace(/[«»"'`.،,؟?!]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
@@ -3000,23 +3000,80 @@ async function handleImageSearch(admin: any, senderId: string, query: string, pa
 // compliant with Meta Messenger policy (no PII, no scraping of private
 // accounts, all data is publicly published by OSM / Esri).
 // =====================================================================
+function normalizePlaceQuery(query: string): string {
+  return query
+    .normalize("NFKC")
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
+    .replace(/[«»"'`()\[\]{}،,؛;؟?!]/g, " ")
+    .replace(/(?:صور[ةه]?\s*(?:ال)?قمر\s*صناعي(?:ة)?|صور[ةه]?\s*جوي(?:ة)?|خريط[ةه]|خارط[ةه]|موقع\s*(?:على|في)?\s*الخريطة|satellite|aerial|map\s+of|on\s+the\s+map)/giu, " ")
+    .replace(/^\s*(?:(?:لـ|لل|ل|في|بـ|ب|من)\s*|(?:of|for|the)\s+)/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function expandPlaceQueries(query: string): string[] {
+  const clean = normalizePlaceQuery(query);
+  const compact = clean.replace(/\s+/g, " ").trim();
+  const lower = compact.toLowerCase();
+  const arabicCompact = compact.replace(/^ال/, "");
+  const variants = new Set<string>();
+
+  const add = (value: string) => {
+    const v = normalizePlaceQuery(value);
+    if (v.length >= 2) variants.add(v);
+  };
+
+  add(compact);
+
+  if (/^(?:رباط|الرباط|rabat)$/i.test(compact)) add("الرباط المغرب");
+  if (/^(?:كعبه|كعبة|الكعبه|الكعبة)$/i.test(arabicCompact) || lower === "kaaba" || lower === "kabaa") {
+    add("الكعبة المشرفة مكة المكرمة السعودية");
+  }
+  if (/^(?:مكه|مكة|مكة المكرمة|مكه المكرمه|الحرم|الحرم المكي)$/i.test(compact)) add("مكة المكرمة السعودية");
+  if (/^(?:دار البيضاء|الدار البيضاء|casablanca)$/i.test(compact)) add("الدار البيضاء المغرب");
+  if (/^(?:فاس|fez|fes)$/i.test(compact)) add("فاس المغرب");
+  if (/^(?:مراكش|مراكش|marrakech)$/i.test(compact)) add("مراكش المغرب");
+
+  if (/المغرب|morocco/i.test(compact) && !/^المغرب$/i.test(compact)) {
+    add(compact.replace(/\b(?:المغرب|morocco)\b/gi, "") + " Morocco");
+  }
+
+  return Array.from(variants);
+}
+
 async function geocodePlace(query: string): Promise<{ lat: number; lon: number; display: string } | null> {
   try {
-    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1&accept-language=ar,en`;
-    const r = await fetch(url, {
-      headers: {
-        "User-Agent": "SolveBot/1.0 (messenger bot; contact via facebook page)",
-        "Accept": "application/json",
-      },
-    });
-    if (!r.ok) { console.warn("[geo] nominatim status", r.status); return null; }
-    const j = await r.json();
-    const first = Array.isArray(j) ? j[0] : null;
-    if (!first) return null;
-    const lat = parseFloat(first.lat);
-    const lon = parseFloat(first.lon);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-    return { lat, lon, display: String(first.display_name || query) };
+    const candidates = expandPlaceQueries(query);
+    for (const candidate of candidates) {
+      const params = new URLSearchParams({
+        q: candidate,
+        format: "json",
+        limit: "5",
+        "accept-language": "ar,en",
+        addressdetails: "1",
+      });
+      const isMoroccoHint = /(?:المغرب|morocco|رباط|الرباط|دار البيضاء|فاس|مراكش)/i.test(candidate);
+      if (isMoroccoHint) params.set("countrycodes", "ma");
+
+      const url = `https://nominatim.openstreetmap.org/search?${params.toString()}`;
+      const r = await fetch(url, {
+        headers: {
+          "User-Agent": "SolveBot/1.0 (messenger bot; contact via facebook page)",
+          "Accept": "application/json",
+        },
+      });
+      if (!r.ok) { console.warn("[geo] nominatim status", r.status, candidate); continue; }
+      const j = await r.json();
+      const rows = Array.isArray(j) ? j : [];
+      const first = rows.find((row: any) => row?.lat && row?.lon) ?? null;
+      if (!first) continue;
+      const lat = parseFloat(first.lat);
+      const lon = parseFloat(first.lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      return { lat, lon, display: String(first.display_name || candidate) };
+    }
+    console.warn("[geo] no result", query, candidates);
+    return null;
   } catch (e) {
     console.error("[geo] err", e);
     return null;
