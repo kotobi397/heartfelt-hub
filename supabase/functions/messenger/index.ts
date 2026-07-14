@@ -1216,26 +1216,24 @@ async function generateImage(senderId: string, prompt: string, admin: any, arabi
 // Generates a short AI video from a text prompt using Replicate's
 // wan-video/wan-2.2-t2v-fast model (fast text-to-video, ~1-2 min).
 async function generateVideo(senderId: string, prompt: string, admin: any): Promise<string> {
-  const lovableKey = Deno.env.get("LOVABLE_API_KEY");
-  const replicateKey = Deno.env.get("REPLICATE_API_KEY");
+  const falKey = Deno.env.get("FAL_KEY");
   const pageToken = Deno.env.get("FB_PAGE_ACCESS_TOKEN");
-  if (!lovableKey || !replicateKey) return JSON.stringify({ ok: false, error: "replicate_not_configured" });
+  if (!falKey) return JSON.stringify({ ok: false, error: "fal_not_configured" });
   if (!pageToken) return JSON.stringify({ ok: false, error: "fb_token_missing" });
   if (!prompt.trim()) return JSON.stringify({ ok: false, error: "empty_prompt" });
 
-  // Safety check on prompt (reuse existing NSFW filters)
   if (isNsfwPrompt(prompt)) {
     return await sendNsfwRefusal(senderId, pageToken, admin, "generate");
   }
 
-  const GW = "https://connector-gateway.lovable.dev/replicate/v1";
   const authHeaders = {
-    "Authorization": `Bearer ${lovableKey}`,
-    "X-Connection-Api-Key": replicateKey,
+    "Authorization": `Key ${falKey}`,
     "Content-Type": "application/json",
   };
+  // fast + cheap text-to-video on fal.ai
+  const MODEL = "fal-ai/ltx-video";
 
-  // Notify the user — this takes 1-3 minutes.
+  // Notify user
   fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1246,65 +1244,77 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
   }).catch(() => {});
 
   try {
-    // Create prediction — wan-2.2-t2v-fast is the fastest text-to-video on Replicate.
-    const createRes = await fetch(`${GW}/models/wan-video/wan-2.2-t2v-fast/predictions`, {
+    // Submit to fal queue
+    const createRes = await fetch(`https://queue.fal.run/${MODEL}`, {
       method: "POST",
       headers: authHeaders,
-      body: JSON.stringify({
-        input: {
-          prompt,
-          aspect_ratio: "16:9",
-          num_frames: 81,
-          resolution: "480p",
-        },
-      }),
+      body: JSON.stringify({ prompt }),
     });
 
-    if (createRes.status === 402) {
+    if (createRes.status === 401 || createRes.status === 403) {
       const body = await createRes.text();
-      console.error("[messenger] replicate 402", body);
+      console.error("[messenger] fal auth failed", createRes.status, body);
       await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           recipient: { id: senderId },
           messaging_type: "RESPONSE",
-          message: { text: "⚠️ حساب Replicate ليس فيه رصيد كافي لتوليد الفيديو. أضف رصيداً من replicate.com/account/billing وحاول مجدداً." },
+          message: { text: "⚠️ مفتاح fal.ai غير صحيح. تحقق من FAL_KEY." },
         }),
       }).catch(() => {});
-      return JSON.stringify({ ok: false, error: "insufficient_credit" });
+      return JSON.stringify({ ok: false, error: "fal_auth_failed" });
+    }
+
+    if (createRes.status === 402 || createRes.status === 429) {
+      const body = await createRes.text();
+      console.error("[messenger] fal billing/rate", createRes.status, body);
+      await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recipient: { id: senderId },
+          messaging_type: "RESPONSE",
+          message: { text: "⚠️ حساب fal.ai بحاجة رصيد أو تجاوز الحد. أضف رصيداً من fal.ai/dashboard/billing وحاول مجدداً." },
+        }),
+      }).catch(() => {});
+      return JSON.stringify({ ok: false, error: "fal_billing" });
     }
 
     if (!createRes.ok) {
       const body = await createRes.text();
-      console.error("[messenger] replicate create failed", createRes.status, body);
-      return JSON.stringify({ ok: false, error: "replicate_create_failed", detail: body.slice(0, 300) });
+      console.error("[messenger] fal create failed", createRes.status, body);
+      return JSON.stringify({ ok: false, error: "fal_create_failed", detail: body.slice(0, 300) });
     }
 
     const created = await createRes.json();
-    const pid: string = created.id;
-    if (!pid) return JSON.stringify({ ok: false, error: "no_prediction_id" });
+    const requestId: string = created.request_id;
+    const statusUrl: string = created.status_url || `https://queue.fal.run/${MODEL}/requests/${requestId}/status`;
+    const responseUrl: string = created.response_url || `https://queue.fal.run/${MODEL}/requests/${requestId}`;
+    if (!requestId) return JSON.stringify({ ok: false, error: "no_request_id" });
 
-    // Poll — up to ~5 minutes with backoff.
+    // Poll
     let videoUrl: string | null = null;
     for (let i = 0; i < 60; i++) {
       await new Promise((r) => setTimeout(r, i < 5 ? 3000 : 6000));
-      const pollRes = await fetch(`${GW}/predictions/${pid}`, { headers: authHeaders });
+      const pollRes = await fetch(statusUrl, { headers: { "Authorization": `Key ${falKey}` } });
       if (!pollRes.ok) continue;
       const p = await pollRes.json();
-      if (p.status === "succeeded") {
-        const out = p.output;
-        videoUrl = Array.isArray(out) ? out[0] : (typeof out === "string" ? out : null);
+      const st = String(p.status ?? "").toUpperCase();
+      if (st === "COMPLETED") {
+        const rr = await fetch(responseUrl, { headers: { "Authorization": `Key ${falKey}` } });
+        if (!rr.ok) return JSON.stringify({ ok: false, error: "fal_response_failed" });
+        const rj = await rr.json();
+        videoUrl = rj?.video?.url ?? rj?.output?.video?.url ?? (typeof rj?.video === "string" ? rj.video : null);
         break;
       }
-      if (p.status === "failed" || p.status === "canceled") {
-        console.error("[messenger] replicate prediction failed", p.error);
-        return JSON.stringify({ ok: false, error: "prediction_failed", detail: String(p.error ?? "") });
+      if (st === "FAILED" || st === "CANCELLED" || st === "ERROR") {
+        console.error("[messenger] fal failed", p);
+        return JSON.stringify({ ok: false, error: "prediction_failed", detail: JSON.stringify(p).slice(0, 300) });
       }
     }
 
     if (!videoUrl) return JSON.stringify({ ok: false, error: "prediction_timeout" });
 
-    // Download the video and re-host on Supabase storage (Replicate URLs expire ~1h).
+    // Download + re-host on Supabase storage
     const vidRes = await fetch(videoUrl);
     if (!vidRes.ok) return JSON.stringify({ ok: false, error: "download_failed" });
     const vidBuf = new Uint8Array(await vidRes.arrayBuffer());
@@ -1321,7 +1331,6 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
       .from("bot-media").createSignedUrl(path, 24 * 3600);
     if (sErr || !signed?.signedUrl) return JSON.stringify({ ok: false, error: "sign_failed" });
 
-    // Send video attachment to Facebook Messenger.
     const fbRes = await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1350,6 +1359,7 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
     return JSON.stringify({ ok: false, error: String(err?.message ?? err) });
   }
 }
+
 
 
 
