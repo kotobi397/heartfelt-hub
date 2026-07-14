@@ -1571,6 +1571,11 @@ async function handleEvent(ev: any, pageId: string | null) {
     reply_to_mid: repliedToMid,
   });
 
+  // Send the page's latest post to this user (once per unique post).
+  maybeSendLatestPagePost(admin, senderId, pageId).catch((e) =>
+    console.error("[messenger] latest post send err", e)
+  );
+
   // Enroll new users into active drip campaigns (fires only on first user msg).
   enrollInActiveDrips(admin, senderId).catch((e) => console.error("[messenger] drip enroll", e));
 
