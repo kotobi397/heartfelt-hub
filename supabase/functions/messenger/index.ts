@@ -2961,7 +2961,12 @@ async function handleImageSearch(admin: any, senderId: string, query: string, pa
   let sent = 0;
   for (const url of urls) {
     if (sent >= IMG_SEARCH_MAX) break;
-    const ok = await fbSendRaw(senderId, { attachment: { type: "image", payload: { url, is_reusable: false } } });
+    // Rehost the image to bot-media so Facebook can always fetch it.
+    // Pinterest/DDG results often reject Facebook's fetcher (hotlink protection),
+    // and FB's Send API returns 200 OK even when it later fails to deliver.
+    const hosted = await fetchAndUploadSearchImage(admin, senderId, url);
+    if (!hosted) continue;
+    const ok = await fbSendRaw(senderId, { attachment: { type: "image", payload: { url: hosted, is_reusable: false } } });
     if (ok) {
       sent++;
       await admin.from("messages").insert({
