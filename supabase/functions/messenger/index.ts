@@ -771,6 +771,7 @@ let arabicFontBytes: Uint8Array | null = null;
 
 const IMAGE_GENERATION_RE = /(?:\b(?:generate|create|make|draw|design|imagine)\b.*\b(?:image|picture|photo|art|illustration|drawing)\b|\b(?:image|picture|art|illustration|drawing)\b.*\b(?:generate|create|make|draw|design)\b|ارسم|إرسم|رسم\s*لي|صمّم|صمم|تصميم\s+ل|تخيّل|تخيل|اصنع\s+(?:لي\s+)?صور[ةه]|أنشئ\s+(?:لي\s+)?صور[ةه]|انشئ\s+(?:لي\s+)?صور[ةه]|ولّد\s+(?:لي\s+)?صور[ةه]|ولد\s+(?:لي\s+)?صور[ةه]|توليد\s+صور[ةه])/iu;
 const IMAGE_GENERATION_CUE_RE = /(?:أنمي|انمي|كرتون|شخصي[ةه]|فتا[ةه]|ولد|رجل|امرأ[ةه]|امرا[ةه]|شعر|يرتدي|ترتدي|جالس|جالسة|واقف|واقفة|خلفي[ةه]|إضاءة|اضاءة|مشهد|خيال|واقعي|سينمائي|ثلاثي\s*الأبعاد|3d|logo|poster|avatar|wallpaper|anime|cartoon|character|wearing|sitting|standing|background|cinematic|realistic)/iu;
+const VIDEO_GENERATION_RE = /(?:\b(?:generate|create|make|imagine)\b.*\b(?:video|clip|movie|animation)\b|\b(?:video|clip|movie|animation)\b.*\b(?:generate|create|make)\b|(?:اعمل|اصنع|أنشئ|انشئ|ولّد|ولد|سوي|سوّي|اصمم|صمّم|صمم)\s+(?:لي\s+)?(?:فيديو|ڤيديو|مقطع|مشهد\s+متحرك)|توليد\s+(?:فيديو|ڤيديو|مقطع)|فيديو\s+(?:عن|ل|من|يظهر)|مقطع\s+(?:عن|ل|من|يظهر))/iu;
 
 function isImageGenerationRequest(text: string): boolean {
   const t = (text || "").trim();
@@ -778,6 +779,12 @@ function isImageGenerationRequest(text: string): boolean {
   // Do not steal real-image web search requests such as "صور ميسي".
   if (/\b(?:pinterest|duckduckgo|real\s+photos?|صور\s+حقيقي|صور\s+من\s+الانترنت|ابحث\s+.*صور|أبحث\s+.*صور|هات\s+صور|اعطني\s+صور|أعطني\s+صور)\b/iu.test(t)) return false;
   return IMAGE_GENERATION_RE.test(t) || (/\b(?:صور[ةه]|image|picture|photo)\b/iu.test(t) && IMAGE_GENERATION_CUE_RE.test(t));
+}
+
+function isVideoGenerationRequest(text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return false;
+  return VIDEO_GENERATION_RE.test(t);
 }
 
 function imageResponseToBytes(j: any): Uint8Array | null {
@@ -1242,34 +1249,84 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
   }).catch(() => {});
 
   try {
-    // Create task (Kling text-to-video, std mode, 5s, 16:9)
-    const createRes = await fetch("https://api.piapi.ai/api/v1/task", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({
-        model: "kling",
-        task_type: "video_generation",
-        input: {
-          prompt,
-          negative_prompt: "",
-          cfg_scale: 0.5,
-          duration: 5,
-          aspect_ratio: "16:9",
-          mode: "std",
+    const taskPayloads = [
+      {
+        label: "kling",
+        payload: {
+          model: "kling",
+          task_type: "video_generation",
+          input: {
+            prompt,
+            negative_prompt: "",
+            cfg_scale: 0.5,
+            duration: 5,
+            aspect_ratio: "16:9",
+            mode: "std",
+          },
+          // Do not force PAYG (`public`). Leaving service_mode empty lets PiAPI use
+          // the workspace's configured mode/trial eligibility instead of always
+          // trying to freeze paid API credits.
+          config: { service_mode: "", webhook_config: { endpoint: "", secret: "" } },
         },
-        config: { service_mode: "public" },
-      }),
-    });
+      },
+      {
+        label: "seedance-2-mini",
+        payload: {
+          model: "seedance",
+          task_type: "seedance-2-mini",
+          input: {
+            prompt,
+            mode: "text_to_video",
+            duration: 5,
+            aspect_ratio: "16:9",
+            resolution: "480p",
+            audio: false,
+          },
+          config: { service_mode: "", webhook_config: { endpoint: "", secret: "" } },
+        },
+      },
+    ];
 
-    if (!createRes.ok) {
+    let created: any = null;
+    let taskId: string | undefined;
+    let lastCreateStatus = 0;
+    let lastCreateBody = "";
+
+    for (const spec of taskPayloads) {
+      const createRes = await fetch("https://api.piapi.ai/api/v1/task", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify(spec.payload),
+      });
       const body = await createRes.text();
-      console.error("[messenger] piapi create failed", createRes.status, body);
+      lastCreateStatus = createRes.status;
+      lastCreateBody = body;
+
+      if (createRes.ok) {
+        try { created = JSON.parse(body); } catch { created = null; }
+        taskId = created?.data?.task_id;
+        if (taskId) {
+          console.log("[messenger] piapi task created", spec.label, taskId);
+          break;
+        }
+        console.error("[messenger] piapi no task_id", spec.label, body);
+        continue;
+      }
+
+      console.error("[messenger] piapi create failed", spec.label, createRes.status, body);
       const lower = body.toLowerCase();
-      const isBilling = createRes.status === 402 || createRes.status === 429 ||
-        lower.includes("insufficient") || lower.includes("balance") || lower.includes("quota");
       const isAuth = createRes.status === 401 || createRes.status === 403;
+      if (isAuth) break;
+    }
+
+    if (!taskId) {
+      const body = lastCreateBody;
+      const lower = body.toLowerCase();
+      const isBilling = lastCreateStatus === 402 || lastCreateStatus === 429 ||
+        lower.includes("insufficient") || lower.includes("balance") || lower.includes("quota");
+      const isAuth = lastCreateStatus === 401 || lastCreateStatus === 403;
       const msg = isBilling
-        ? "⚠️ رصيد PiAPI غير كافٍ. أضف رصيداً من piapi.ai وحاول مجدداً."
+        ? "⚠️ PiAPI رفض إنشاء الفيديو لأن رصيد API غير متاح أو محجوز. إن كان لديك رصيد تجربة في Playground فقد لا يكون مفعّلاً لطلبات API؛ راجع Balance/Frozen quotas في PiAPI أو راسل دعمهم لمسح الرصيد المحجوز."
         : isAuth
           ? "⚠️ مفتاح PiAPI غير صحيح. تحقق من PIAPI_KEY."
           : "⚠️ تعذر إنشاء الفيديو من PiAPI حالياً.";
@@ -1282,13 +1339,6 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
         }),
       }).catch(() => {});
       return JSON.stringify({ ok: false, error: isBilling ? "piapi_billing" : isAuth ? "piapi_auth_failed" : "piapi_create_failed", detail: body.slice(0, 300) });
-    }
-
-    const created = await createRes.json();
-    const taskId: string | undefined = created?.data?.task_id;
-    if (!taskId) {
-      console.error("[messenger] piapi no task_id", created);
-      return JSON.stringify({ ok: false, error: "no_task_id" });
     }
 
     // Poll — Kling std ~1-3 min. Up to ~5 min.
@@ -1305,6 +1355,7 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
         videoUrl = pj?.data?.output?.video_url
           ?? pj?.data?.output?.works?.[0]?.video?.resource
           ?? pj?.data?.output?.video?.url
+          ?? (typeof pj?.data?.output?.video === "string" ? pj.data.output.video : null)
           ?? null;
         break;
       }
@@ -1774,6 +1825,19 @@ async function handleEvent(ev: any, pageId: string | null) {
   // Direct image-generation fast path. Do not leave this to the chat model:
   // when image generation is slow, the model may apologize and promise a retry
   // instead of actually sending an image. This path always invokes the image tool.
+  if (text && imageUrls.length === 0 && isVideoGenerationRequest(text)) {
+    const result = await generateVideo(senderId, text, admin);
+    let parsed: any = null;
+    try { parsed = JSON.parse(result); } catch { parsed = null; }
+    if (parsed?.ok === true) {
+      await sendAndLog(admin, senderId, "✅ تم إرسال الفيديو.", pageId, userMsgStart, mid ?? null);
+    } else if (!parsed?.user_notified) {
+      console.error("[messenger] direct video generation failed", result);
+      await sendAndLog(admin, senderId, "تعذّر إنشاء الفيديو الآن. إذا ظهر خطأ رصيد فهو من رصيد API في PiAPI وليس من إعداد البوت.", pageId, userMsgStart, mid ?? null);
+    }
+    return;
+  }
+
   if (text && imageUrls.length === 0 && isImageGenerationRequest(text)) {
     const result = await generateImage(senderId, text, admin);
     let parsed: any = null;
