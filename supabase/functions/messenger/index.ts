@@ -1212,99 +1212,112 @@ async function generateImage(senderId: string, prompt: string, admin: any, arabi
   }
 }
 
-// ============ VIDEO GENERATION (Replicate via Lovable Connector Gateway) ============
-// Generates a short AI video from a text prompt using Replicate's
-// wan-video/wan-2.2-t2v-fast model (fast text-to-video, ~1-2 min).
+// ============ VIDEO GENERATION (PiAPI — Kling text-to-video) ============
+// Uses PiAPI unified endpoint: POST /api/v1/task then poll GET /api/v1/task/{id}
+// Docs: https://piapi.ai/docs/kling-api/create-task
 async function generateVideo(senderId: string, prompt: string, admin: any): Promise<string> {
-  const lovableKey = Deno.env.get("LOVABLE_API_KEY");
-  const replicateKey = Deno.env.get("REPLICATE_API_KEY");
+  const piapiKey = Deno.env.get("PIAPI_KEY");
   const pageToken = Deno.env.get("FB_PAGE_ACCESS_TOKEN");
-  if (!lovableKey || !replicateKey) return JSON.stringify({ ok: false, error: "replicate_not_configured" });
+  if (!piapiKey) return JSON.stringify({ ok: false, error: "piapi_not_configured" });
   if (!pageToken) return JSON.stringify({ ok: false, error: "fb_token_missing" });
   if (!prompt.trim()) return JSON.stringify({ ok: false, error: "empty_prompt" });
 
-  // Safety check on prompt (reuse existing NSFW filters)
   if (isNsfwPrompt(prompt)) {
     return await sendNsfwRefusal(senderId, pageToken, admin, "generate");
   }
 
-  const GW = "https://connector-gateway.lovable.dev/replicate/v1";
   const authHeaders = {
-    "Authorization": `Bearer ${lovableKey}`,
-    "X-Connection-Api-Key": replicateKey,
+    "x-api-key": piapiKey,
     "Content-Type": "application/json",
   };
 
-  // Notify the user — this takes 1-3 minutes.
+  // Notify user
   fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       recipient: { id: senderId },
       messaging_type: "RESPONSE",
-      message: { text: "🎬 جاري إنشاء الفيديو... قد يستغرق دقيقة أو دقيقتين، انتظر قليلاً." },
+      message: { text: "🎬 جاري إنشاء الفيديو... قد يستغرق دقيقة أو أكثر، انتظر قليلاً." },
     }),
   }).catch(() => {});
 
   try {
-    // Create prediction — wan-2.2-t2v-fast is the fastest text-to-video on Replicate.
-    const createRes = await fetch(`${GW}/models/wan-video/wan-2.2-t2v-fast/predictions`, {
+    // Create task (Kling text-to-video, std mode, 5s, 16:9)
+    const createRes = await fetch("https://api.piapi.ai/api/v1/task", {
       method: "POST",
       headers: authHeaders,
       body: JSON.stringify({
+        model: "kling",
+        task_type: "video_generation",
         input: {
           prompt,
+          negative_prompt: "",
+          cfg_scale: 0.5,
+          duration: 5,
           aspect_ratio: "16:9",
-          num_frames: 81,
-          resolution: "480p",
+          mode: "std",
         },
+        config: { service_mode: "public" },
       }),
     });
 
-    if (createRes.status === 402) {
+    if (!createRes.ok) {
       const body = await createRes.text();
-      console.error("[messenger] replicate 402", body);
+      console.error("[messenger] piapi create failed", createRes.status, body);
+      const lower = body.toLowerCase();
+      const isBilling = createRes.status === 402 || createRes.status === 429 ||
+        lower.includes("insufficient") || lower.includes("balance") || lower.includes("quota");
+      const isAuth = createRes.status === 401 || createRes.status === 403;
+      const msg = isBilling
+        ? "⚠️ رصيد PiAPI غير كافٍ. أضف رصيداً من piapi.ai وحاول مجدداً."
+        : isAuth
+          ? "⚠️ مفتاح PiAPI غير صحيح. تحقق من PIAPI_KEY."
+          : "⚠️ تعذر إنشاء الفيديو من PiAPI حالياً.";
       await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           recipient: { id: senderId },
           messaging_type: "RESPONSE",
-          message: { text: "⚠️ حساب Replicate ليس فيه رصيد كافي لتوليد الفيديو. أضف رصيداً من replicate.com/account/billing وحاول مجدداً." },
+          message: { text: msg },
         }),
       }).catch(() => {});
-      return JSON.stringify({ ok: false, error: "insufficient_credit" });
-    }
-
-    if (!createRes.ok) {
-      const body = await createRes.text();
-      console.error("[messenger] replicate create failed", createRes.status, body);
-      return JSON.stringify({ ok: false, error: "replicate_create_failed", detail: body.slice(0, 300) });
+      return JSON.stringify({ ok: false, error: isBilling ? "piapi_billing" : isAuth ? "piapi_auth_failed" : "piapi_create_failed", detail: body.slice(0, 300) });
     }
 
     const created = await createRes.json();
-    const pid: string = created.id;
-    if (!pid) return JSON.stringify({ ok: false, error: "no_prediction_id" });
+    const taskId: string | undefined = created?.data?.task_id;
+    if (!taskId) {
+      console.error("[messenger] piapi no task_id", created);
+      return JSON.stringify({ ok: false, error: "no_task_id" });
+    }
 
-    // Poll — up to ~5 minutes with backoff.
+    // Poll — Kling std ~1-3 min. Up to ~5 min.
     let videoUrl: string | null = null;
     for (let i = 0; i < 60; i++) {
-      await new Promise((r) => setTimeout(r, i < 5 ? 3000 : 6000));
-      const pollRes = await fetch(`${GW}/predictions/${pid}`, { headers: authHeaders });
+      await new Promise((r) => setTimeout(r, i < 5 ? 4000 : 6000));
+      const pollRes = await fetch(`https://api.piapi.ai/api/v1/task/${taskId}`, {
+        headers: { "x-api-key": piapiKey },
+      });
       if (!pollRes.ok) continue;
-      const p = await pollRes.json();
-      if (p.status === "succeeded") {
-        const out = p.output;
-        videoUrl = Array.isArray(out) ? out[0] : (typeof out === "string" ? out : null);
+      const pj = await pollRes.json();
+      const st = String(pj?.data?.status ?? "").toLowerCase();
+      if (st === "completed" || st === "success") {
+        videoUrl = pj?.data?.output?.video_url
+          ?? pj?.data?.output?.works?.[0]?.video?.resource
+          ?? pj?.data?.output?.video?.url
+          ?? null;
         break;
       }
-      if (p.status === "failed" || p.status === "canceled") {
-        console.error("[messenger] replicate prediction failed", p.error);
-        return JSON.stringify({ ok: false, error: "prediction_failed", detail: String(p.error ?? "") });
+      if (st === "failed" || st === "cancelled" || st === "error") {
+        const errMsg = pj?.data?.error?.message || pj?.data?.error?.raw_message || "";
+        console.error("[messenger] piapi task failed", pj?.data?.error);
+        return JSON.stringify({ ok: false, error: "prediction_failed", detail: String(errMsg).slice(0, 300) });
       }
     }
 
     if (!videoUrl) return JSON.stringify({ ok: false, error: "prediction_timeout" });
 
-    // Download the video and re-host on Supabase storage (Replicate URLs expire ~1h).
+    // Download + re-host on Supabase storage
     const vidRes = await fetch(videoUrl);
     if (!vidRes.ok) return JSON.stringify({ ok: false, error: "download_failed" });
     const vidBuf = new Uint8Array(await vidRes.arrayBuffer());
@@ -1321,7 +1334,6 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
       .from("bot-media").createSignedUrl(path, 24 * 3600);
     if (sErr || !signed?.signedUrl) return JSON.stringify({ ok: false, error: "sign_failed" });
 
-    // Send video attachment to Facebook Messenger.
     const fbRes = await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1350,6 +1362,7 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
     return JSON.stringify({ ok: false, error: String(err?.message ?? err) });
   }
 }
+
 
 
 
