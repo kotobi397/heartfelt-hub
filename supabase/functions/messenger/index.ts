@@ -1205,7 +1205,7 @@ function shouldEditImage(text: string): boolean {
 async function editUserImage(
   admin: any,
   senderId: string,
-  pageId: string,
+  pageId: string | null,
   pageToken: string,
   sourceUrl: string,
   instruction: string,
