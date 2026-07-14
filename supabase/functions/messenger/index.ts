@@ -3057,7 +3057,10 @@ async function handleMapSearch(
     imgUrl = `https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/export?bbox=${bbox}&bboxSR=4326&imageSR=3857&size=800,600&format=jpg&f=image`;
     suffix = "sat";
   } else {
-    imgUrl = `https://staticmap.openstreetmap.de/staticmap.php?center=${lat},${lon}&zoom=15&size=800x600&maptype=mapnik&markers=${lat},${lon},red-pushpin`;
+    // Esri World Street Map public REST export — reliable from edge runtime.
+    const d = 0.01;
+    const bbox = `${lon - d},${lat - d},${lon + d},${lat + d}`;
+    imgUrl = `https://services.arcgisonline.com/arcgis/rest/services/World_Street_Map/MapServer/export?bbox=${bbox}&bboxSR=4326&imageSR=3857&size=800,600&format=png&f=image`;
     suffix = "map";
   }
 
