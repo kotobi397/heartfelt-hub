@@ -1249,35 +1249,82 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
   }).catch(() => {});
 
   try {
-    // Create task (Kling text-to-video, std mode, 5s, 16:9)
-    const createRes = await fetch("https://api.piapi.ai/api/v1/task", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({
-        model: "kling",
-        task_type: "video_generation",
-        input: {
-          prompt,
-          negative_prompt: "",
-          cfg_scale: 0.5,
-          duration: 5,
-          aspect_ratio: "16:9",
-          mode: "std",
+    const taskPayloads = [
+      {
+        label: "kling",
+        payload: {
+          model: "kling",
+          task_type: "video_generation",
+          input: {
+            prompt,
+            negative_prompt: "",
+            cfg_scale: 0.5,
+            duration: 5,
+            aspect_ratio: "16:9",
+            mode: "std",
+          },
+          // Do not force PAYG (`public`). Leaving service_mode empty lets PiAPI use
+          // the workspace's configured mode/trial eligibility instead of always
+          // trying to freeze paid API credits.
+          config: { service_mode: "", webhook_config: { endpoint: "", secret: "" } },
         },
-        // Do not force PAYG (`public`). Leaving service_mode empty lets PiAPI use
-        // the workspace's configured mode/trial eligibility instead of always
-        // trying to freeze paid API credits.
-        config: { service_mode: "", webhook_config: { endpoint: "", secret: "" } },
-      }),
-    });
+      },
+      {
+        label: "seedance-2-mini",
+        payload: {
+          model: "seedance",
+          task_type: "seedance-2-mini",
+          input: {
+            prompt,
+            mode: "text_to_video",
+            duration: 5,
+            aspect_ratio: "16:9",
+            resolution: "480p",
+            audio: false,
+          },
+          config: { service_mode: "", webhook_config: { endpoint: "", secret: "" } },
+        },
+      },
+    ];
 
-    if (!createRes.ok) {
+    let created: any = null;
+    let taskId: string | undefined;
+    let lastCreateStatus = 0;
+    let lastCreateBody = "";
+
+    for (const spec of taskPayloads) {
+      const createRes = await fetch("https://api.piapi.ai/api/v1/task", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify(spec.payload),
+      });
       const body = await createRes.text();
-      console.error("[messenger] piapi create failed", createRes.status, body);
+      lastCreateStatus = createRes.status;
+      lastCreateBody = body;
+
+      if (createRes.ok) {
+        try { created = JSON.parse(body); } catch { created = null; }
+        taskId = created?.data?.task_id;
+        if (taskId) {
+          console.log("[messenger] piapi task created", spec.label, taskId);
+          break;
+        }
+        console.error("[messenger] piapi no task_id", spec.label, body);
+        continue;
+      }
+
+      console.error("[messenger] piapi create failed", spec.label, createRes.status, body);
       const lower = body.toLowerCase();
-      const isBilling = createRes.status === 402 || createRes.status === 429 ||
-        lower.includes("insufficient") || lower.includes("balance") || lower.includes("quota");
       const isAuth = createRes.status === 401 || createRes.status === 403;
+      if (isAuth) break;
+    }
+
+    if (!taskId) {
+      const body = lastCreateBody;
+      const lower = body.toLowerCase();
+      const isBilling = lastCreateStatus === 402 || lastCreateStatus === 429 ||
+        lower.includes("insufficient") || lower.includes("balance") || lower.includes("quota");
+      const isAuth = lastCreateStatus === 401 || lastCreateStatus === 403;
       const msg = isBilling
         ? "⚠️ PiAPI رفض إنشاء الفيديو لأن رصيد API غير متاح أو محجوز. إن كان لديك رصيد تجربة في Playground فقد لا يكون مفعّلاً لطلبات API؛ راجع Balance/Frozen quotas في PiAPI أو راسل دعمهم لمسح الرصيد المحجوز."
         : isAuth
@@ -1294,13 +1341,6 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
       return JSON.stringify({ ok: false, error: isBilling ? "piapi_billing" : isAuth ? "piapi_auth_failed" : "piapi_create_failed", detail: body.slice(0, 300) });
     }
 
-    const created = await createRes.json();
-    const taskId: string | undefined = created?.data?.task_id;
-    if (!taskId) {
-      console.error("[messenger] piapi no task_id", created);
-      return JSON.stringify({ ok: false, error: "no_task_id" });
-    }
-
     // Poll — Kling std ~1-3 min. Up to ~5 min.
     let videoUrl: string | null = null;
     for (let i = 0; i < 60; i++) {
@@ -1315,6 +1355,7 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
         videoUrl = pj?.data?.output?.video_url
           ?? pj?.data?.output?.works?.[0]?.video?.resource
           ?? pj?.data?.output?.video?.url
+          ?? (typeof pj?.data?.output?.video === "string" ? pj.data.output.video : null)
           ?? null;
         break;
       }
