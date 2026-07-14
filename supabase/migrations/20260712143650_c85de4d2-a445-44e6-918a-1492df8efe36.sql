@@ -1,0 +1,1 @@
+ALTER TABLE public.app_config ADD COLUMN IF NOT EXISTS mistral_api_keys jsonb NOT NULL DEFAULT '[]'::jsonb;
