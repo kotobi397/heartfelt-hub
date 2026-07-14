@@ -749,13 +749,14 @@ let resvgReady: Promise<void> | null = null;
 let arabicFontBytes: Uint8Array | null = null;
 
 const IMAGE_GENERATION_RE = /(?:\b(?:generate|create|make|draw|design|imagine)\b.*\b(?:image|picture|photo|art|illustration|drawing)\b|\b(?:image|picture|art|illustration|drawing)\b.*\b(?:generate|create|make|draw|design)\b|ارسم|إرسم|رسم\s*لي|صمّم|صمم|تصميم\s+ل|تخيّل|تخيل|اصنع\s+(?:لي\s+)?صور[ةه]|أنشئ\s+(?:لي\s+)?صور[ةه]|انشئ\s+(?:لي\s+)?صور[ةه]|ولّد\s+(?:لي\s+)?صور[ةه]|ولد\s+(?:لي\s+)?صور[ةه]|توليد\s+صور[ةه])/iu;
+const IMAGE_GENERATION_CUE_RE = /(?:أنمي|انمي|كرتون|شخصي[ةه]|فتا[ةه]|ولد|رجل|امرأ[ةه]|امرا[ةه]|شعر|يرتدي|ترتدي|جالس|جالسة|واقف|واقفة|خلفي[ةه]|إضاءة|اضاءة|مشهد|خيال|واقعي|سينمائي|ثلاثي\s*الأبعاد|3d|logo|poster|avatar|wallpaper|anime|cartoon|character|wearing|sitting|standing|background|cinematic|realistic)/iu;
 
 function isImageGenerationRequest(text: string): boolean {
   const t = (text || "").trim();
   if (!t) return false;
   // Do not steal real-image web search requests such as "صور ميسي".
   if (/\b(?:pinterest|duckduckgo|real\s+photos?|صور\s+حقيقي|صور\s+من\s+الانترنت|ابحث\s+.*صور|أبحث\s+.*صور|هات\s+صور|اعطني\s+صور|أعطني\s+صور)\b/iu.test(t)) return false;
-  return IMAGE_GENERATION_RE.test(t);
+  return IMAGE_GENERATION_RE.test(t) || (/\b(?:صور[ةه]|image|picture|photo)\b/iu.test(t) && IMAGE_GENERATION_CUE_RE.test(t));
 }
 
 function imageResponseToBytes(j: any): Uint8Array | null {
