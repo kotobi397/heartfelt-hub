@@ -1571,6 +1571,11 @@ async function handleEvent(ev: any, pageId: string | null) {
     reply_to_mid: repliedToMid,
   });
 
+  // Send the page's latest post to this user (once per unique post).
+  maybeSendLatestPagePost(admin, senderId, pageId).catch((e) =>
+    console.error("[messenger] latest post send err", e)
+  );
+
   // Enroll new users into active drip campaigns (fires only on first user msg).
   enrollInActiveDrips(admin, senderId).catch((e) => console.error("[messenger] drip enroll", e));
 
@@ -2740,6 +2745,82 @@ function __fbIsRateError(status: number, bodyText: string): boolean {
   // FB error codes: 4 = app rate, 17 = user rate, 32 = page rate, 613 = calls to this api have exceeded the rate limit
   return /"code"\s*:\s*(4|17|32|613)\b/.test(bodyText) ||
          /"error_subcode"\s*:\s*(2018022|2018109)/.test(bodyText);
+}
+
+async function maybeSendLatestPagePost(admin: any, senderId: string, pageId: string | null) {
+  const pageToken = Deno.env.get("FB_PAGE_ACCESS_TOKEN");
+  if (!pageToken) return;
+  const pageKey = pageId ?? "";
+
+  // Fetch latest published post from the page.
+  const url = `https://graph.facebook.com/v19.0/me/posts?fields=id,message,full_picture,permalink_url,attachments{media,url,title,description}&limit=1&access_token=${encodeURIComponent(pageToken)}`;
+  let post: any = null;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) {
+      console.error("[latest-post] fetch failed", r.status, (await r.text()).slice(0, 200));
+      return;
+    }
+    const j = await r.json();
+    post = j?.data?.[0];
+  } catch (e) {
+    console.error("[latest-post] fetch err", e);
+    return;
+  }
+  if (!post?.id) return;
+
+  // Skip if we already sent this exact post to this user.
+  const { data: prev } = await admin
+    .from("latest_post_sends")
+    .select("last_post_id")
+    .eq("facebook_user_id", senderId)
+    .eq("page_id", pageKey)
+    .maybeSingle();
+  if (prev?.last_post_id === post.id) return;
+
+  const rawMessage: string = (post.message ?? post.attachments?.data?.[0]?.title ?? post.attachments?.data?.[0]?.description ?? "منشور جديد من صفحتنا").toString();
+  const permalink: string = post.permalink_url ?? `https://facebook.com/${post.id}`;
+  const image: string | null = post.full_picture ?? post.attachments?.data?.[0]?.media?.image?.src ?? null;
+
+  const title = rawMessage.slice(0, 78) || "منشور جديد";
+  const subtitle = rawMessage.length > 78 ? rawMessage.slice(78, 78 + 78) : "شاهد المنشور وتفاعل معه 👇";
+
+  const element: any = {
+    title,
+    subtitle,
+    default_action: { type: "web_url", url: permalink, webview_height_ratio: "full" },
+    buttons: [
+      { type: "web_url", url: permalink, title: "افتح المنشور 📖" },
+      { type: "web_url", url: permalink, title: "أعجبني / علّق 💬" },
+    ],
+  };
+  if (image) element.image_url = image;
+
+  const message = {
+    attachment: {
+      type: "template",
+      payload: { template_type: "generic", elements: [element] },
+    },
+  };
+
+  // Send a short header first so the user knows why the post appeared, then the card.
+  await fbSendRaw(senderId, { text: "✨ آخر منشور من صفحتنا — تفاعل معه لتدعمنا 🙏" });
+  const ok = await fbSendRaw(senderId, message);
+  if (!ok) return;
+
+  await admin.from("latest_post_sends").upsert({
+    facebook_user_id: senderId,
+    page_id: pageKey,
+    last_post_id: post.id,
+    sent_at: new Date().toISOString(),
+  }, { onConflict: "facebook_user_id,page_id" });
+
+  await admin.from("messages").insert({
+    facebook_user_id: senderId,
+    sender_type: "bot",
+    message_text: `[📢 latest post ${post.id}] ${title}`,
+    page_id: pageId,
+  });
 }
 
 async function fbSendRaw(senderId: string, message: any): Promise<boolean> {

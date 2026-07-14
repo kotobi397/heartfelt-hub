@@ -366,6 +366,27 @@ export type Database = {
         }
         Relationships: []
       }
+      latest_post_sends: {
+        Row: {
+          facebook_user_id: string
+          last_post_id: string
+          page_id: string
+          sent_at: string
+        }
+        Insert: {
+          facebook_user_id: string
+          last_post_id: string
+          page_id?: string
+          sent_at?: string
+        }
+        Update: {
+          facebook_user_id?: string
+          last_post_id?: string
+          page_id?: string
+          sent_at?: string
+        }
+        Relationships: []
+      }
       manga_search_cache: {
         Row: {
           created_at: string
