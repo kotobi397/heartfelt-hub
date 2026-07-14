@@ -1212,13 +1212,13 @@ async function generateImage(senderId: string, prompt: string, admin: any, arabi
   }
 }
 
-// ============ VIDEO GENERATION (Replicate via Lovable Connector Gateway) ============
-// Generates a short AI video from a text prompt using Replicate's
-// wan-video/wan-2.2-t2v-fast model (fast text-to-video, ~1-2 min).
+// ============ VIDEO GENERATION (PiAPI — Kling text-to-video) ============
+// Uses PiAPI unified endpoint: POST /api/v1/task then poll GET /api/v1/task/{id}
+// Docs: https://piapi.ai/docs/kling-api/create-task
 async function generateVideo(senderId: string, prompt: string, admin: any): Promise<string> {
-  const falKey = Deno.env.get("FAL_KEY");
+  const piapiKey = Deno.env.get("PIAPI_KEY");
   const pageToken = Deno.env.get("FB_PAGE_ACCESS_TOKEN");
-  if (!falKey) return JSON.stringify({ ok: false, error: "fal_not_configured" });
+  if (!piapiKey) return JSON.stringify({ ok: false, error: "piapi_not_configured" });
   if (!pageToken) return JSON.stringify({ ok: false, error: "fb_token_missing" });
   if (!prompt.trim()) return JSON.stringify({ ok: false, error: "empty_prompt" });
 
@@ -1227,11 +1227,9 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
   }
 
   const authHeaders = {
-    "Authorization": `Key ${falKey}`,
+    "x-api-key": piapiKey,
     "Content-Type": "application/json",
   };
-  // fast + cheap text-to-video on fal.ai
-  const MODEL = "fal-ai/ltx-video";
 
   // Notify user
   fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
@@ -1239,30 +1237,42 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
     body: JSON.stringify({
       recipient: { id: senderId },
       messaging_type: "RESPONSE",
-      message: { text: "🎬 جاري إنشاء الفيديو... قد يستغرق دقيقة أو دقيقتين، انتظر قليلاً." },
+      message: { text: "🎬 جاري إنشاء الفيديو... قد يستغرق دقيقة أو أكثر، انتظر قليلاً." },
     }),
   }).catch(() => {});
 
   try {
-    // Submit to fal queue
-    const createRes = await fetch(`https://queue.fal.run/${MODEL}`, {
+    // Create task (Kling text-to-video, std mode, 5s, 16:9)
+    const createRes = await fetch("https://api.piapi.ai/api/v1/task", {
       method: "POST",
       headers: authHeaders,
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({
+        model: "kling",
+        task_type: "video_generation",
+        input: {
+          prompt,
+          negative_prompt: "",
+          cfg_scale: 0.5,
+          duration: 5,
+          aspect_ratio: "16:9",
+          mode: "std",
+        },
+        config: { service_mode: "public" },
+      }),
     });
 
     if (!createRes.ok) {
       const body = await createRes.text();
-      console.error("[messenger] fal create failed", createRes.status, body);
+      console.error("[messenger] piapi create failed", createRes.status, body);
       const lower = body.toLowerCase();
       const isBilling = createRes.status === 402 || createRes.status === 429 ||
-        lower.includes("exhausted balance") || lower.includes("top up") || lower.includes("balance");
-      const isAuth = (createRes.status === 401 || createRes.status === 403) && !isBilling;
+        lower.includes("insufficient") || lower.includes("balance") || lower.includes("quota");
+      const isAuth = createRes.status === 401 || createRes.status === 403;
       const msg = isBilling
-        ? "⚠️ حساب fal.ai بدون رصيد. أضف رصيداً من fal.ai/dashboard/billing وحاول مجدداً."
+        ? "⚠️ رصيد PiAPI غير كافٍ. أضف رصيداً من piapi.ai وحاول مجدداً."
         : isAuth
-          ? "⚠️ مفتاح fal.ai غير صحيح. تحقق من FAL_KEY."
-          : "⚠️ تعذر إنشاء الفيديو من fal.ai حالياً.";
+          ? "⚠️ مفتاح PiAPI غير صحيح. تحقق من PIAPI_KEY."
+          : "⚠️ تعذر إنشاء الفيديو من PiAPI حالياً.";
       await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1271,34 +1281,37 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
           message: { text: msg },
         }),
       }).catch(() => {});
-      return JSON.stringify({ ok: false, error: isBilling ? "fal_billing" : isAuth ? "fal_auth_failed" : "fal_create_failed", detail: body.slice(0, 300) });
+      return JSON.stringify({ ok: false, error: isBilling ? "piapi_billing" : isAuth ? "piapi_auth_failed" : "piapi_create_failed", detail: body.slice(0, 300) });
     }
 
-
     const created = await createRes.json();
-    const requestId: string = created.request_id;
-    const statusUrl: string = created.status_url || `https://queue.fal.run/${MODEL}/requests/${requestId}/status`;
-    const responseUrl: string = created.response_url || `https://queue.fal.run/${MODEL}/requests/${requestId}`;
-    if (!requestId) return JSON.stringify({ ok: false, error: "no_request_id" });
+    const taskId: string | undefined = created?.data?.task_id;
+    if (!taskId) {
+      console.error("[messenger] piapi no task_id", created);
+      return JSON.stringify({ ok: false, error: "no_task_id" });
+    }
 
-    // Poll
+    // Poll — Kling std ~1-3 min. Up to ~5 min.
     let videoUrl: string | null = null;
     for (let i = 0; i < 60; i++) {
-      await new Promise((r) => setTimeout(r, i < 5 ? 3000 : 6000));
-      const pollRes = await fetch(statusUrl, { headers: { "Authorization": `Key ${falKey}` } });
+      await new Promise((r) => setTimeout(r, i < 5 ? 4000 : 6000));
+      const pollRes = await fetch(`https://api.piapi.ai/api/v1/task/${taskId}`, {
+        headers: { "x-api-key": piapiKey },
+      });
       if (!pollRes.ok) continue;
-      const p = await pollRes.json();
-      const st = String(p.status ?? "").toUpperCase();
-      if (st === "COMPLETED") {
-        const rr = await fetch(responseUrl, { headers: { "Authorization": `Key ${falKey}` } });
-        if (!rr.ok) return JSON.stringify({ ok: false, error: "fal_response_failed" });
-        const rj = await rr.json();
-        videoUrl = rj?.video?.url ?? rj?.output?.video?.url ?? (typeof rj?.video === "string" ? rj.video : null);
+      const pj = await pollRes.json();
+      const st = String(pj?.data?.status ?? "").toLowerCase();
+      if (st === "completed" || st === "success") {
+        videoUrl = pj?.data?.output?.video_url
+          ?? pj?.data?.output?.works?.[0]?.video?.resource
+          ?? pj?.data?.output?.video?.url
+          ?? null;
         break;
       }
-      if (st === "FAILED" || st === "CANCELLED" || st === "ERROR") {
-        console.error("[messenger] fal failed", p);
-        return JSON.stringify({ ok: false, error: "prediction_failed", detail: JSON.stringify(p).slice(0, 300) });
+      if (st === "failed" || st === "cancelled" || st === "error") {
+        const errMsg = pj?.data?.error?.message || pj?.data?.error?.raw_message || "";
+        console.error("[messenger] piapi task failed", pj?.data?.error);
+        return JSON.stringify({ ok: false, error: "prediction_failed", detail: String(errMsg).slice(0, 300) });
       }
     }
 
