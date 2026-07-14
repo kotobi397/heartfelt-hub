@@ -3005,7 +3005,7 @@ function normalizePlaceQuery(query: string): string {
     .normalize("NFKC")
     .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
     .replace(/[«»"'`()\[\]{}،,؛;؟?!]/g, " ")
-    .replace(/\b(?:صوره|صورة|صور|خريطه|خريطة|خارطه|خارطة|موقع|القمر|قمر|صناعيه|صناعية|صناعي|جويه|جوية|جوي|satellite|aerial|map|image|photo)\b/giu, " ")
+    .replace(/(?:صور[ةه]?\s*(?:ال)?قمر\s*صناعي(?:ة)?|صور[ةه]?\s*جوي(?:ة)?|خريط[ةه]|خارط[ةه]|موقع\s*(?:على|في)?\s*الخريطة|satellite|aerial|map\s+of|on\s+the\s+map)/giu, " ")
     .replace(/^\s*(?:(?:لـ|لل|ل|في|بـ|ب|من)\s*|(?:of|for|the)\s+)/i, "")
     .replace(/\s+/g, " ")
     .trim();
