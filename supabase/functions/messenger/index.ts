@@ -1251,39 +1251,29 @@ async function generateVideo(senderId: string, prompt: string, admin: any): Prom
       body: JSON.stringify({ prompt }),
     });
 
-    if (createRes.status === 401 || createRes.status === 403) {
-      const body = await createRes.text();
-      console.error("[messenger] fal auth failed", createRes.status, body);
-      await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          recipient: { id: senderId },
-          messaging_type: "RESPONSE",
-          message: { text: "⚠️ مفتاح fal.ai غير صحيح. تحقق من FAL_KEY." },
-        }),
-      }).catch(() => {});
-      return JSON.stringify({ ok: false, error: "fal_auth_failed" });
-    }
-
-    if (createRes.status === 402 || createRes.status === 429) {
-      const body = await createRes.text();
-      console.error("[messenger] fal billing/rate", createRes.status, body);
-      await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          recipient: { id: senderId },
-          messaging_type: "RESPONSE",
-          message: { text: "⚠️ حساب fal.ai بحاجة رصيد أو تجاوز الحد. أضف رصيداً من fal.ai/dashboard/billing وحاول مجدداً." },
-        }),
-      }).catch(() => {});
-      return JSON.stringify({ ok: false, error: "fal_billing" });
-    }
-
     if (!createRes.ok) {
       const body = await createRes.text();
       console.error("[messenger] fal create failed", createRes.status, body);
-      return JSON.stringify({ ok: false, error: "fal_create_failed", detail: body.slice(0, 300) });
+      const lower = body.toLowerCase();
+      const isBilling = createRes.status === 402 || createRes.status === 429 ||
+        lower.includes("exhausted balance") || lower.includes("top up") || lower.includes("balance");
+      const isAuth = (createRes.status === 401 || createRes.status === 403) && !isBilling;
+      const msg = isBilling
+        ? "⚠️ حساب fal.ai بدون رصيد. أضف رصيداً من fal.ai/dashboard/billing وحاول مجدداً."
+        : isAuth
+          ? "⚠️ مفتاح fal.ai غير صحيح. تحقق من FAL_KEY."
+          : "⚠️ تعذر إنشاء الفيديو من fal.ai حالياً.";
+      await fetch(`${FB_API}?access_token=${encodeURIComponent(pageToken)}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recipient: { id: senderId },
+          messaging_type: "RESPONSE",
+          message: { text: msg },
+        }),
+      }).catch(() => {});
+      return JSON.stringify({ ok: false, error: isBilling ? "fal_billing" : isAuth ? "fal_auth_failed" : "fal_create_failed", detail: body.slice(0, 300) });
     }
+
 
     const created = await createRes.json();
     const requestId: string = created.request_id;
