@@ -2752,8 +2752,11 @@ async function maybeSendLatestPagePost(admin: any, senderId: string, pageId: str
   if (!pageToken) return;
   const pageKey = pageId ?? "";
 
-  // Fetch latest published post from the page.
-  const url = `https://graph.facebook.com/v19.0/me/posts?fields=id,message,full_picture,permalink_url,attachments{media,url,title,description}&limit=1&access_token=${encodeURIComponent(pageToken)}`;
+  // Fetch latest published post from the page. Use published_posts (only posts by
+  // the page, excludes visitor posts / tagged), request created_time, fetch a few
+  // and pick the newest by created_time — pinned/scheduled posts can appear
+  // out of order on /me/posts, so we sort client-side to be safe.
+  const url = `https://graph.facebook.com/v19.0/me/published_posts?fields=id,message,created_time,full_picture,permalink_url,attachments{media,url,title,description}&limit=10&access_token=${encodeURIComponent(pageToken)}`;
   let post: any = null;
   try {
     const r = await fetch(url);
@@ -2762,7 +2765,9 @@ async function maybeSendLatestPagePost(admin: any, senderId: string, pageId: str
       return;
     }
     const j = await r.json();
-    post = j?.data?.[0];
+    const list: any[] = Array.isArray(j?.data) ? j.data : [];
+    list.sort((a, b) => new Date(b?.created_time ?? 0).getTime() - new Date(a?.created_time ?? 0).getTime());
+    post = list[0];
   } catch (e) {
     console.error("[latest-post] fetch err", e);
     return;
