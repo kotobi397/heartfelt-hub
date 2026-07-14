@@ -3047,22 +3047,14 @@ async function handleMapSearch(
   }
   const { lat, lon, display } = geo;
 
-  // Build image URL — public endpoints, no API key required.
-  let imgUrl: string;
-  let suffix: string;
-  if (satellite) {
-    // Esri World Imagery public REST export. bbox ≈ 0.008° radius (~900m).
-    const d = 0.008;
-    const bbox = `${lon - d},${lat - d},${lon + d},${lat + d}`;
-    imgUrl = `https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/export?bbox=${bbox}&bboxSR=4326&imageSR=3857&size=800,600&format=jpg&f=image`;
-    suffix = "sat";
-  } else {
-    // Esri World Street Map public REST export — reliable from edge runtime.
-    const d = 0.01;
-    const bbox = `${lon - d},${lat - d},${lon + d},${lat + d}`;
-    imgUrl = `https://services.arcgisonline.com/arcgis/rest/services/World_Street_Map/MapServer/export?bbox=${bbox}&bboxSR=4326&imageSR=3857&size=800,600&format=png&f=image`;
-    suffix = "map";
-  }
+  // Yandex Static Maps — free, no API key, global coverage, supports markers.
+  // l=map (schematic) or l=sat,skl (satellite with labels).
+  // Max size 650x450. Marker: pt=lon,lat,pm2rdm (red pushpin).
+  const layer = satellite ? "sat,skl" : "map";
+  const zoom = satellite ? 16 : 13;
+  const marker = `${lon},${lat},pm2rdm`;
+  let imgUrl = `https://static-maps.yandex.ru/1.x/?ll=${lon},${lat}&z=${zoom}&size=650,450&l=${layer}&pt=${marker}&lang=ar_SA`;
+  const suffix = satellite ? "sat" : "map";
 
   const hostedUrl = await fetchAndUploadMapImage(admin, senderId, imgUrl, suffix);
   if (!hostedUrl) {
