@@ -748,6 +748,100 @@ let cachedImageAgentId: string | null = null;
 let resvgReady: Promise<void> | null = null;
 let arabicFontBytes: Uint8Array | null = null;
 
+const IMAGE_GENERATION_RE = /(?:\b(?:generate|create|make|draw|design|imagine)\b.*\b(?:image|picture|photo|art|illustration|drawing)\b|\b(?:image|picture|art|illustration|drawing)\b.*\b(?:generate|create|make|draw|design)\b|ارسم|إرسم|رسم\s*لي|صمّم|صمم|تصميم\s+ل|تخيّل|تخيل|اصنع\s+(?:لي\s+)?صور[ةه]|أنشئ\s+(?:لي\s+)?صور[ةه]|انشئ\s+(?:لي\s+)?صور[ةه]|ولّد\s+(?:لي\s+)?صور[ةه]|ولد\s+(?:لي\s+)?صور[ةه]|توليد\s+صور[ةه])/iu;
+
+function isImageGenerationRequest(text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return false;
+  // Do not steal real-image web search requests such as "صور ميسي".
+  if (/\b(?:pinterest|duckduckgo|real\s+photos?|صور\s+حقيقي|صور\s+من\s+الانترنت|ابحث\s+.*صور|أبحث\s+.*صور|هات\s+صور|اعطني\s+صور|أعطني\s+صور)\b/iu.test(t)) return false;
+  return IMAGE_GENERATION_RE.test(t);
+}
+
+function imageResponseToBytes(j: any): Uint8Array | null {
+  const urls: string[] = [];
+  const b64s: string[] = [];
+
+  const addMaybe = (value: unknown) => {
+    if (typeof value !== "string" || !value.trim()) return;
+    const s = value.trim();
+    if (s.startsWith("data:image/")) urls.push(s);
+    else if (/^[A-Za-z0-9+/=\n\r]+$/.test(s) && s.length > 200) b64s.push(s);
+  };
+
+  for (const item of Array.isArray(j?.data) ? j.data : []) {
+    addMaybe(item?.b64_json);
+    addMaybe(item?.url);
+  }
+  for (const choice of Array.isArray(j?.choices) ? j.choices : []) {
+    const msg = choice?.message ?? {};
+    for (const img of Array.isArray(msg?.images) ? msg.images : []) addMaybe(img?.image_url?.url ?? img?.url);
+    const content = msg?.content;
+    if (Array.isArray(content)) {
+      for (const part of content) addMaybe(part?.image_url?.url ?? part?.url ?? part?.b64_json ?? part?.data);
+    } else {
+      addMaybe(content);
+    }
+  }
+
+  const raw = b64s[0] ?? (urls[0]?.startsWith("data:image/") ? urls[0].split(",", 2)[1] : null);
+  if (!raw) return null;
+  try {
+    const bin = atob(raw.replace(/\s+/g, ""));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch (e) {
+    console.error("[messenger] image b64 decode failed", e);
+    return null;
+  }
+}
+
+async function generateImageViaLovableGateway(prompt: string, arabicText: string): Promise<Uint8Array | null> {
+  const lovableKey = Deno.env.get("LOVABLE_API_KEY");
+  if (!lovableKey) {
+    console.error("[messenger] LOVABLE_API_KEY missing for image generation");
+    return null;
+  }
+
+  const gatewayPrompt = [
+    "Generate one polished, high-quality, safe-for-work image from the user's request.",
+    "Respect the visual details exactly. Do not add captions, logos, watermarks, UI, or random text.",
+    arabicText.trim()
+      ? "Leave a clean empty horizontal banner area at the bottom of the image for later Arabic text overlay; put no text inside the generated image."
+      : "If the user did not explicitly request visible text, include no text anywhere in the image.",
+    `User request: ${prompt.slice(0, 1800)}`,
+  ].join("\n");
+
+  const models = ["google/gemini-3.1-flash-image", "google/gemini-3-pro-image"];
+  for (const model of models) {
+    try {
+      const res = await fetch("https://ai.gateway.lovable.dev/v1/images/generations", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${lovableKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: [{ type: "text", text: gatewayPrompt }] }],
+          modalities: ["image", "text"],
+        }),
+        signal: AbortSignal.timeout(model.includes("flash") ? 55_000 : 75_000),
+      });
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        console.error("[messenger] gateway image failed", model, res.status, t.slice(0, 500));
+        continue;
+      }
+      const j = await res.json();
+      const bytes = imageResponseToBytes(j);
+      if (bytes && bytes.byteLength > 1000) return bytes;
+      console.error("[messenger] gateway image no bytes", model, JSON.stringify(j).slice(0, 500));
+    } catch (err) {
+      console.error("[messenger] gateway image error", model, err);
+    }
+  }
+  return null;
+}
+
 async function ensureResvg() {
   if (!resvgReady) {
     resvgReady = (async () => {
