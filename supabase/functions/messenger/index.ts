@@ -2036,7 +2036,14 @@ async function runWithTools(messages: any[], model: string, senderId: string, ad
       for (const tc of toolCalls) {
         let args: any = {};
         try { args = JSON.parse(tc.function?.arguments ?? "{}"); } catch {}
-        const result = await executeTool(tc.function?.name ?? "", args, senderId, admin);
+      const result = await executeTool(tc.function?.name ?? "", args, senderId, admin);
+      if (tc.function?.name === "generate_image") {
+        let parsed: any = null;
+        try { parsed = JSON.parse(result); } catch { parsed = null; }
+        if (parsed?.ok === true) return "✅ تم إرسال الصورة.";
+        if (parsed?.user_notified) return "";
+        return "تعذّر إنشاء الصورة الآن بسبب ضغط الخدمة، جرّب بعد قليل 🙏";
+      }
         convo.push({ role: "tool", tool_call_id: tc.id, name: tc.function?.name, content: result });
       }
     } catch (err) {
