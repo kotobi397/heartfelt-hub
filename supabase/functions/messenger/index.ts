@@ -659,26 +659,35 @@ async function translateText(text: string, target: string): Promise<string> {
   }
 }
 
+// Map old OpenAI voice names to Mistral Voxtral preset voices.
+// The Voxtral model supports Arabic text with any voice (cross-lingual).
+const MISTRAL_VOICE_MAP: Record<string, string> = {
+  alloy: "gb_jane_neutral",
+  nova: "fr_marie_neutral",
+  shimmer: "gb_jane_cheerful",
+  echo: "gb_oliver_neutral",
+  onyx: "en_paul_confident",
+  fable: "en_paul_cheerful",
+};
+
 async function sendVoiceNote(senderId: string, text: string, voice: string, admin: any): Promise<string> {
-  const lovableKey = Deno.env.get("LOVABLE_API_KEY");
+  const mistralKey = await getMistralKeyForTTS(admin);
   const pageToken = Deno.env.get("FB_PAGE_ACCESS_TOKEN");
-  if (!lovableKey) { console.error("[messenger] TTS: LOVABLE_API_KEY missing"); return JSON.stringify({ ok: false, error: "tts_unavailable" }); }
+  if (!mistralKey) { console.error("[messenger] TTS: MISTRAL_API_KEY missing"); return JSON.stringify({ ok: false, error: "tts_unavailable" }); }
   if (!pageToken) { console.error("[messenger] TTS: FB_PAGE_ACCESS_TOKEN missing"); return JSON.stringify({ ok: false, error: "fb_token_missing" }); }
 
   const trimmed = text.slice(0, 1500);
-  const validVoices = ["alloy", "echo", "shimmer", "nova", "onyx", "fable"];
-  const v = validVoices.includes(voice) ? voice : "alloy";
-  console.log("[messenger] TTS start", { senderId, chars: trimmed.length, voice: v });
+  const mistralVoice = MISTRAL_VOICE_MAP[voice] ?? "gb_jane_neutral";
+  console.log("[messenger] TTS start (mistral)", { senderId, chars: trimmed.length, voice: mistralVoice });
 
   try {
-    // Generate MP3 (non-streaming for simplicity)
-    const ttsRes = await fetch("https://ai.gateway.lovable.dev/v1/audio/speech", {
+    const ttsRes = await fetch("https://api.mistral.ai/v1/audio/speech", {
       method: "POST",
-      headers: { Authorization: `Bearer ${lovableKey}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${mistralKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "openai/gpt-4o-mini-tts",
+        model: "voxtral-mini-tts-2603",
         input: trimmed,
-        voice: v,
+        voice: mistralVoice,
         response_format: "mp3",
       }),
     });
@@ -687,7 +696,16 @@ async function sendVoiceNote(senderId: string, text: string, voice: string, admi
       console.error("[messenger] TTS failed", ttsRes.status, errText);
       return JSON.stringify({ ok: false, error: `tts_${ttsRes.status}` });
     }
-    const audioBuf = new Uint8Array(await ttsRes.arrayBuffer());
+    const ttsJson = await ttsRes.json();
+    const b64 = ttsJson?.audio_data;
+    if (!b64 || typeof b64 !== "string") {
+      console.error("[messenger] TTS: no audio_data in response");
+      return JSON.stringify({ ok: false, error: "tts_empty" });
+    }
+    // Decode base64 → bytes
+    const binStr = atob(b64);
+    const audioBuf = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) audioBuf[i] = binStr.charCodeAt(i);
 
     // Upload to private bucket
     const path = `voice/${senderId}/${Date.now()}.mp3`;
