@@ -671,7 +671,7 @@ const MISTRAL_VOICE_MAP: Record<string, string> = {
 };
 
 async function sendVoiceNote(senderId: string, text: string, voice: string, admin: any): Promise<string> {
-  const mistralKey = await getMistralKeyForTTS(admin);
+  const mistralKey = await getMistralKey();
   const pageToken = Deno.env.get("FB_PAGE_ACCESS_TOKEN");
   if (!mistralKey) { console.error("[messenger] TTS: MISTRAL_API_KEY missing"); return JSON.stringify({ ok: false, error: "tts_unavailable" }); }
   if (!pageToken) { console.error("[messenger] TTS: FB_PAGE_ACCESS_TOKEN missing"); return JSON.stringify({ ok: false, error: "fb_token_missing" }); }
