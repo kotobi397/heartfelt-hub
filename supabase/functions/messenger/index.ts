@@ -753,7 +753,7 @@ async function sendVoiceNote(senderId: string, text: string, voice: string, admi
       message_text: `🔊 [ملاحظة صوتية أُرسلت] ${trimmed.slice(0, 80)}${trimmed.length > 80 ? "..." : ""}`,
     });
 
-    return JSON.stringify({ ok: true, sent: true, voice: v, length: trimmed.length });
+    return JSON.stringify({ ok: true, sent: true, voice: mistralVoice, length: trimmed.length });
   } catch (err: any) {
     console.error("[messenger] voice note error", err);
     return JSON.stringify({ ok: false, error: String(err?.message ?? err) });
